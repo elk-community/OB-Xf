@@ -34,6 +34,7 @@ include(libs/sst/sst-plugininfra/cmake/git-version-functions.cmake)
 version_from_versionfile_or_git()
 message(STATUS "DISPLAY_VERSION=${GIT_IMPLIED_DISPLAY_VERSION}; COMMIT_HASH=${GIT_COMMIT_HASH}; BRANCH=${GIT_BRANCH}")
 
+find_package(JUCE CONFIG REQUIRED)        # If you've installed JUCE to your system
 add_subdirectory(libs)
 message(STATUS "After libs, MODULE_PATH is ${CMAKE_MODULE_PATH}")
 version_from_versionfile_or_git()
@@ -89,15 +90,14 @@ endif()
 add_compile_definitions(JUCE_WEB_BROWSER=0)
 add_compile_definitions(JUCE_USE_CURL=0)
 
-list(APPEND OBXF_JUCE_FORMATS VST3 Standalone)
-
-if(APPLE)
-    list(APPEND OBXF_JUCE_FORMATS AU)
+if(CMAKE_CROSSCOMPILING)
+    # Yocto ARM sysroot: off_t == off64_t causes redefinition errors in
+    # JUCE's bundled zlib. Use system zlib instead.
+    find_package(ZLIB REQUIRED)
+    add_compile_definitions(JUCE_INCLUDE_ZLIB_CODE=0)
 endif()
 
-if(UNIX AND NOT APPLE)
-    list(APPEND OBXF_JUCE_FORMATS LV2)
-endif()
+list(APPEND OBXF_JUCE_FORMATS VST3)
 
 juce_add_plugin(OB-Xf
     COMPANY_NAME "Surge Synth Team"
@@ -167,6 +167,7 @@ target_link_libraries(OB-Xf PRIVATE
 
     sst-plugininfra::filesystem
     sst-plugininfra
+    $<$<BOOL:${CMAKE_CROSSCOMPILING}>:ZLIB::ZLIB>
 )
 
 target_compile_definitions(OB-Xf PRIVATE JUCE_VST3_CAN_REPLACE_VST2=0 OBXF_VERSION_STR="${PROJECT_VERSION}")
@@ -185,6 +186,7 @@ elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
 else()
     target_compile_options(OB-Xf PRIVATE
             -Wall -Werror
+            $<$<BOOL:${CMAKE_CROSSCOMPILING}>:-Wno-error=array-bounds>
             $<$<COMPILE_LANGUAGE:C,OBJC>:-Wno-maybe-uninitialized> # for juce
     )
     if(${CMAKE_CXX_COMPILER_VERSION} LESS 13)
