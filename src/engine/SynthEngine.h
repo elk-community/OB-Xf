@@ -1,16 +1,12 @@
 /*
- * OB-Xf - a continuation of the last open source version of OB-Xd.
- *
  * OB-Xd was originally written by Vadim Filatov, and then a version
  * was released under the GPL3 at https://github.com/reales/OB-Xd.
  * Subsequently, the product was continued by DiscoDSP and the copyright
- * holders as an excellent closed source product. For more info,
- * see "HISTORY.md" in the root of this repository.
+ * holders as an excellent closed source product.
  *
- * This repository is a successor to the last open source release,
- * a version marked as 2.11. Copyright 2013-2025 by the authors
- * as indicated in the original release, and subsequent authors
- * per the GitHub transaction log.
+ * This repository is a successor to OB-Xd version 2.11.
+ * Copyright 2013-2025 by the authors as indicated in the original release,
+ * and subsequent authors as per GitHub transaction log.
  *
  * OB-Xf is released under the GNU General Public Licence v3 or later
  * (GPL-3.0-or-later). The license is found in the file "LICENSE"
@@ -59,6 +55,14 @@ class SynthEngine
         return std::round(res);
     }
 
+    /* Mirror a parameter's normalized value into the matrix bases, so per-voice
+     * modulation is applied to the patch value along the target's own curve. */
+    void setMatrixBase(MatrixTarget target, float val)
+    {
+        synth.matrixBases.set(target, val);
+        synth.recalculateAllMatrices();
+    }
+
     // JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SynthEngine)
 
   public:
@@ -105,14 +109,22 @@ class SynthEngine
          * of midi to toggle to sounding happens before this call
          * which renders the DSP
          */
+        /* Resonance is both log-scaled and smoothed, so the smoother carries the normalized
+         * value and the curve is applied per voice. Voices with no resonance modulation
+         * share the unmodulated result, so only modulated ones pay for the scaling. */
+        constexpr auto resScale = matrixTargetScaling(MatrixTarget::FilterResonance);
+        const auto unmodulatedRes = resScale.apply(re);
+
         auto tvc = synth.getTotalVoiceCount();
         for (int i = 0; i < tvc; i++)
         {
             auto &v = synth.voices[i];
             if (v.isSounding())
             {
+                const auto resMod = v.matrixAdjustments.modFor(MatrixTarget::FilterResonance);
+
                 v.par.filter.cutoff = co;
-                v.filter.setResonance(re);
+                v.filter.setResonance(resMod == 0.f ? unmodulatedRes : resScale.apply(re + resMod));
                 v.filter.setMultimode(fm);
                 v.pitchBend = pb;
             }
@@ -125,6 +137,7 @@ class SynthEngine
     float getVoiceAmpEnvStatus(uint8_t idx) { return synth.voices[idx].getVoiceAmpEnvStatus(); };
 
     Motherboard *getMotherboard() { return &synth; };
+    const Motherboard *getMotherboard() const { return &synth; };
 
     void processNoteOn(int note, float velocity, int8_t channel)
     {
@@ -157,6 +170,13 @@ class SynthEngine
 
     void processPitchWheel(float val) { pitchBendSmoother.setStep(val); }
 
+    void processMPEPitch(int8_t channel, float val) { synth.processMPEPitch(channel, val); }
+    void processMPETimbre(int8_t channel, float val) { synth.processMPETimbre(channel, val); }
+    void processMPEChannelPressure(int8_t channel, float val)
+    {
+        synth.processMPEChannelPressure(channel, val);
+    }
+
     void processModWheel(float val) { modWheelSmoother.setStep(val); }
 
     void processModWheelSmoothed(float val) { synth.vibratoAmount = val; }
@@ -179,6 +199,7 @@ class SynthEngine
             break;
         }
     }
+    void processVoiceReassign(float val) { synth.reallocate = val >= 0.5f; }
     void processVelToAmpEnv(float val) { ForEachVoice(par.extmod.velToAmp = val); }
     void processVelToFilterEnv(float val) { ForEachVoice(par.extmod.velToFilter = val); }
     void processVibratoLFORate(float val) { synth.vibratoLFO.setRate(linsc(val, 2.f, 12.f)); }
@@ -267,11 +288,13 @@ class SynthEngine
     {
         const auto v = logsc(logsc(val, 0.f, 1.f, 60.f), 0.f, 60.f, 10.f);
         ForEachVoice(par.lfo1.amt1 = v);
+        setMatrixBase(MatrixTarget::LFO1ModAmount1, val);
     }
     void processLFO1ModAmount2(float val)
     {
         const auto v = linsc(val, 0.f, 0.7f);
         ForEachVoice(par.lfo1.amt2 = v);
+        setMatrixBase(MatrixTarget::LFO1ModAmount2, val);
     }
     void processLFO1ToOsc1Pitch(float val)
     {
@@ -311,6 +334,8 @@ class SynthEngine
         const auto v = logsc(val, 0.f, 250.f, 3775.f);
         ForEachVoice(lfo2.setRate(v));
         ForEachVoice(lfo2.setRateNormalized(val));
+        ForEachVoice(lfo2BaseRate = v);
+        setMatrixBase(MatrixTarget::LFO2Rate, val);
     }
     void processLFO2Sync(float val)
     {
@@ -325,11 +350,13 @@ class SynthEngine
     {
         const auto v = logsc(logsc(val, 0.f, 1.f, 60.f), 0.f, 60.f, 10.f);
         ForEachVoice(par.lfo2.amt1 = v);
+        setMatrixBase(MatrixTarget::LFO2ModAmount1, val);
     }
     void processLFO2ModAmount2(float val)
     {
         const auto v = linsc(val, 0.f, 0.7f);
         ForEachVoice(par.lfo2.amt2 = v);
+        setMatrixBase(MatrixTarget::LFO2ModAmount2, val);
     }
     void processLFO2ToOsc1Pitch(float val)
     {
@@ -368,11 +395,13 @@ class SynthEngine
     {
         const auto v = logsc(val, 0.001f, 1.f);
         ForEachVoice(oscs.par.pitch.unisonDetune = v);
+        setMatrixBase(MatrixTarget::UnisonDetune, val);
     }
     void processOscPW(float val)
     {
         const auto v = linsc(val, 0.f, 0.95f);
         ForEachVoice(oscs.par.osc.pw = v);
+        setMatrixBase(MatrixTarget::OscPW, val);
     }
     // PW env range is actually 0.95f, but because Envelope.h sustains at 90% fullscale
     // for some reason, we adjust 0.95f by a reciprocal of 0.9 here
@@ -385,6 +414,7 @@ class SynthEngine
     {
         const auto v = linsc(val, 0.f, 0.95f);
         ForEachVoice(par.osc.pwOsc2Offset = v);
+        setMatrixBase(MatrixTarget::Osc2PWOffset, val);
     }
     void processEnvToPWBothOscs(float val)
     {
@@ -407,6 +437,7 @@ class SynthEngine
     {
         const auto v = val * 48.f;
         ForEachVoice(oscs.par.osc.crossmod = v);
+        setMatrixBase(MatrixTarget::OscCrossmod, val);
     }
     // pitch env range is actually 36 st, but because Envelope.h sustains at 90% fullscale
     // for some reason, we adjust 36 semitones by a reciprocal of 0.9 here
@@ -424,11 +455,18 @@ class SynthEngine
     {
         const auto v = (val * 48.f);
         ForEachVoice(oscs.par.osc.pitch1 = v);
+        setMatrixBase(MatrixTarget::Osc1Pitch, val);
     }
     void processOsc2Pitch(float val)
     {
         const auto v = (val * 48.f);
         ForEachVoice(oscs.par.osc.pitch2 = v);
+        setMatrixBase(MatrixTarget::Osc2Pitch, val);
+    }
+    void processOsc2Keytrack(float val)
+    {
+        const auto v = val >= 0.5f;
+        ForEachVoice(oscs.par.osc.keytrack2 = v);
     }
     void processEnvToPitchInvert(float val)
     {
@@ -440,11 +478,27 @@ class SynthEngine
         const auto v = val >= 0.5f;
         ForEachVoice(oscs.par.mod.envToPWInvert = v);
     }
-    void processOsc1Volume(float val) { ForEachVoice(oscs.par.mix.osc1 = val); }
-    void processOsc2Volume(float val) { ForEachVoice(oscs.par.mix.osc2 = val); }
-    void processRingModVolume(float val) { ForEachVoice(oscs.par.mix.ringMod = val); }
-    void processNoiseVolume(float val) { ForEachVoice(oscs.par.mix.noise = val); }
-    void processNoiseColor(float val) { ForEachVoice(oscs.par.mix.noiseColor = val); }
+    void processOsc1Volume(float val)
+    {
+        ForEachVoice(oscs.par.mix.osc1 = val);
+        setMatrixBase(MatrixTarget::Osc1Vol, val);
+    }
+    void processOsc2Volume(float val)
+    {
+        ForEachVoice(oscs.par.mix.osc2 = val);
+        setMatrixBase(MatrixTarget::Osc2Vol, val);
+    }
+    void processRingModVolume(float val)
+    {
+        ForEachVoice(oscs.par.mix.ringMod = val);
+        setMatrixBase(MatrixTarget::RingModVol, val);
+    }
+    void processNoiseVolume(float val)
+    {
+        ForEachVoice(oscs.par.mix.noise = val);
+        setMatrixBase(MatrixTarget::NoiseVol, val);
+    }
+    void processNoiseColor(float val) { ForEachVoice(setNoiseColor(val)); }
     void processOscBrightness(float val)
     {
         const auto v = linsc(val, 7000.f, 26000.f);
@@ -454,6 +508,7 @@ class SynthEngine
     {
         const auto v = logsc(val, 0.001f, 0.6f);
         ForEachVoice(oscs.par.osc.detune = v);
+        setMatrixBase(MatrixTarget::Osc2Detune, val);
     }
     void processOsc1Saw(float val)
     {
@@ -476,10 +531,9 @@ class SynthEngine
         ForEachVoice(oscs.par.osc.pulse2 = v);
     }
     void processFilterCutoff(float val) { cutoffSmoother.setStep(linsc(val, 0.f, 120.f)); }
-    void processFilterResonance(float val)
-    {
-        resSmoother.setStep(0.991f - logsc(1.f - val, 0.f, 0.991f, 40.f));
-    }
+    /* Smooths the normalized value, not the scaled one — processSample applies the curve
+     * per voice so resonance modulation follows it. See matrixTargetScaling(). */
+    void processFilterResonance(float val) { resSmoother.setStep(val); }
     void processFilter2PoleBPBlend(float val)
     {
         const auto v = val >= 0.5f;
@@ -512,6 +566,8 @@ class SynthEngine
     {
         const auto v = logsc(val, 4.f, 60000.f, 900.f);
         ForEachVoice(ampEnv.setAttack(v));
+        ForEachVoice(ampEnvAttackBase = v);
+        setMatrixBase(MatrixTarget::AmpEnvAttack, val);
     }
     void processAmpEnvDecay(float val)
     {
@@ -523,12 +579,16 @@ class SynthEngine
     {
         const auto v = logsc(val, 8.f, 60000.f, 900.f);
         ForEachVoice(ampEnv.setRelease(v));
+        ForEachVoice(ampEnvReleaseBase = v);
+        setMatrixBase(MatrixTarget::AmpEnvRelease, val);
     }
     void processFilterEnvAttackCurve(float val) { ForEachVoice(filterEnv.setAttackCurve(val)); }
     void processFilterEnvAttack(float val)
     {
         const auto v = logsc(val, 1.f, 60000.f, 900.f);
         ForEachVoice(filterEnv.setAttack(v));
+        ForEachVoice(filterEnvAttackBase = v);
+        setMatrixBase(MatrixTarget::FilterEnvAttack, val);
     }
     void processFilterEnvDecay(float val)
     {
@@ -540,6 +600,8 @@ class SynthEngine
     {
         const auto v = logsc(val, 1.f, 60000.f, 900.f);
         ForEachVoice(filterEnv.setRelease(v));
+        ForEachVoice(filterEnvReleaseBase = v);
+        setMatrixBase(MatrixTarget::FilterEnvRelease, val);
     }
     void processEnvelopeSlop(float val) { ForEachVoice(setEnvTimingOffset(val)); }
     void processFilterSlop(float val)

@@ -1,16 +1,12 @@
 /*
- * OB-Xf - a continuation of the last open source version of OB-Xd.
- *
  * OB-Xd was originally written by Vadim Filatov, and then a version
  * was released under the GPL3 at https://github.com/reales/OB-Xd.
  * Subsequently, the product was continued by DiscoDSP and the copyright
- * holders as an excellent closed source product. For more info,
- * see "HISTORY.md" in the root of this repository.
+ * holders as an excellent closed source product.
  *
- * This repository is a successor to the last open source release,
- * a version marked as 2.11. Copyright 2013-2025 by the authors
- * as indicated in the original release, and subsequent authors
- * per the GitHub transaction log.
+ * This repository is a successor to OB-Xd version 2.11.
+ * Copyright 2013-2025 by the authors as indicated in the original release,
+ * and subsequent authors as per GitHub transaction log.
  *
  * OB-Xf is released under the GNU General Public Licence v3 or later
  * (GPL-3.0-or-later). The license is found in the file "LICENSE"
@@ -48,11 +44,16 @@ static const std::string UnisonDetune{"UnisonDetune"};
 
 static const std::string EnvLegatoMode{"EnvLegatoMode"};
 static const std::string NotePriority{"NotePriority"};
+static const std::string VoiceReassign{"VoiceReassign"};
 
 // OSCILLATORS
+// matrix routing: both Osc1+Osc2 pitch (no JUCE parameter)
+static const std::string OscPitch{"OscPitch"};
+
 static const std::string Osc1Pitch{"Osc1Pitch"};
 static const std::string Osc2Detune{"Osc2Detune"};
 static const std::string Osc2Pitch{"Osc2Pitch"};
+static const std::string Osc2Keytrack{"Osc2Keytrack"};
 
 static const std::string Osc1SawWave{"Osc1SawWave"};
 static const std::string Osc2SawWave{"Osc2SawWave"};
@@ -193,24 +194,44 @@ static const std::string Volume{"Volume"};
 static const std::string Transpose{"Transpose"};
 static const std::string Tune{"Tune"};
 
+// MTS-ESP
+static const std::string MTSESPSettings{"MTS-ESP Settings"};
+static const std::string MTSESPDynamic{"Dynamic MTS-ESP"};
+
 // GLOBAL
 static const std::string Polyphony{"Polyphony"};
 static const std::string HQMode{"High Quality Mode"};
 static const std::string UnisonVoices{"Unison Voices"};
 
-static const std::string Portamento{"Portamento"};
+static const std::string Portamento{"Glide"};
 static const std::string Unison{"Unison"};
 static const std::string UnisonDetune{"Unison Detune"};
 
 static const std::string EnvLegatoMode{"Envelope Legato Mode"};
 static const std::string NotePriority{"Note Priority"};
+static const std::string VoiceReassign{"Voice Reassign"};
 
 static const std::string MidiLearn{"MIDI Learn"};
 
+static const std::string MPEMode{"MPE Mode"};
+static const std::string MPESettings{"MPE Settings"};
+
+static const std::string LockHQ{"Lock High Quality Mode"};
+
+// MPE
+static const std::string MPEStrikeSelect{"Show MPE Strike Modulations"};
+static const std::string MPELiftSelect{"Show MPE Lift Modulations"};
+static const std::string MPEPressSelect{"Show MPE Press Modulations"};
+static const std::string MPESlideSelect{"Show MPE Slide Modulations"};
+static const std::string MPEGlideRange{"MPE Glide Range"};
+
 // OSCILLATORS
+static const std::string OscPitch{"Osc Pitch"};
+
 static const std::string Osc1Pitch{"Osc 1 Pitch"};
 static const std::string Osc2Detune{"Osc 2 Detune"};
 static const std::string Osc2Pitch{"Osc 2 Pitch"};
+static const std::string Osc2Keytrack{"Osc 2 Keytrack"};
 
 static const std::string Osc1SawWave{"Osc 1 Saw Wave"};
 static const std::string Osc1PulseWave{"Osc 1 Pulse Wave"};
@@ -219,15 +240,15 @@ static const std::string Osc2SawWave{"Osc 2 Saw Wave"};
 static const std::string Osc2PulseWave{"Osc 2 Pulse Wave"};
 
 static const std::string OscPW{"Osc Pulsewidth"};
-static const std::string Osc2PWOffset{"Osc 2 PW Offset"};
+static const std::string Osc2PWOffset{"Osc 2 Pulsewidth Offset"};
 
 static const std::string EnvToPitchAmount{"Filter Env to Pitch"};
 static const std::string EnvToPitchBothOscs{"Filter Env to Both Osc Pitch"};
 static const std::string EnvToPitchInvert{"Invert Filter Env to Pitch"};
 
-static const std::string EnvToPWAmount{"Filter Env to PW"};
-static const std::string EnvToPWBothOscs{"Filter Env to Both Osc PW"};
-static const std::string EnvToPWInvert{"Invert Filter Env to PW"};
+static const std::string EnvToPWAmount{"Filter Env to Pulsewidth"};
+static const std::string EnvToPWBothOscs{"Filter Env to Both Osc Pulsewidth"};
+static const std::string EnvToPWInvert{"Invert Filter Env to Pulsewidth"};
 
 static const std::string OscCrossmod{"Cross Modulation"};
 static const std::string OscSync{"Osc Sync"};
@@ -241,8 +262,11 @@ static const std::string NoiseVol{"Noise Volume"};
 static const std::string NoiseColor{"Noise Color"};
 
 // CONTROL
+static const std::string LockPitchBend{"Lock Pitch Bend Range"};
+
 static const std::string BendUpRange{"Pitch Bend Up"};
 static const std::string BendDownRange{"Pitch Bend Down"};
+
 static const std::string BendOsc2Only{"Pitch Bend Osc 2 Only"};
 
 static const std::string VibratoWave{"Vibrato Wave"};
@@ -307,7 +331,7 @@ static const std::string LFO2ToOsc2PW{"LFO 2 to Osc 2 PW"};
 static const std::string LFO2ToVolume{"LFO 2 to Volume"};
 
 // VOICE VARIATION
-static const std::string PortamentoSlop{"Portamento Slop"};
+static const std::string PortamentoSlop{"Glide Slop"};
 static const std::string FilterSlop{"Filter Slop"};
 static const std::string EnvelopeSlop{"Envelope Slop"};
 static const std::string LevelSlop{"Level Slop"};
@@ -349,7 +373,7 @@ static const std::string PrevPatch{"Previous Patch"};
 static const std::string NextPatch{"Next Patch"};
 
 static const std::string SavePatch{"Save Patch"};
-static const std::string Undo{"Undo/Redo"};
+static const std::string Undo{"Undo"};
 
 static const std::string InitializePatch{"Initialize Patch"};
 static const std::string RandomizePatch{"Randomize Patch"};

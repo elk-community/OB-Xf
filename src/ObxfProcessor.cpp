@@ -1,0 +1,601 @@
+/*
+ * OB-Xd was originally written by Vadim Filatov, and then a version
+ * was released under the GPL3 at https://github.com/reales/OB-Xd.
+ * Subsequently, the product was continued by DiscoDSP and the copyright
+ * holders as an excellent closed source product.
+ *
+ * This repository is a successor to OB-Xd version 2.11.
+ * Copyright 2013-2025 by the authors as indicated in the original release,
+ * and subsequent authors as per GitHub transaction log.
+ *
+ * OB-Xf is released under the GNU General Public Licence v3 or later
+ * (GPL-3.0-or-later). The license is found in the file "LICENSE"
+ * in the root of this repository or at:
+ * https://www.gnu.org/licenses/gpl-3.0.en.html
+ *
+ * Source code is available at https://github.com/surge-synthesizer/OB-Xf
+ */
+
+#include "ObxfEditor.h"
+#include "ObxfProcessor.h"
+#include "Constants.h"
+#include "sst/plugininfra/version_information.h"
+
+#if OBLOG_TO_FILE
+std::ofstream logHack;
+#endif
+
+ObxfAudioProcessor::ObxfAudioProcessor()
+#ifndef JucePlugin_PreferredChannelConfigurations
+    : AudioProcessor(BusesProperties()
+#if !JucePlugin_IsMidiEffect
+#if !JucePlugin_IsSynth
+                         .withInput("Input", juce::AudioChannelSet::stereo(), true)
+#endif
+                         .withOutput("Output", juce::AudioChannelSet::stereo(), true)
+#endif
+                         ),
+      utils(std::make_unique<Utils>()),
+      paramCoordinator(std::make_unique<ParameterCoordinator>(*this, *this, *this, synth)),
+      paramAlgos(std::make_unique<ParameterAlgos>(*paramCoordinator, *utils)),
+      midiHandler(synth, bindings, *paramCoordinator, *this),
+      state(std::make_unique<StateManager>(this))
+{
+    OBLOG(general, "OB-Xf startup, version "
+                       << sst::plugininfra::VersionInformation::project_version_and_hash);
+
+    isHostAutomatedChange = true;
+
+    mutateSections.set();
+
+    initializeCallbacks();
+
+    juce::PropertiesFile::Options options;
+    options.applicationName = JucePlugin_Name;
+    options.storageFormat = juce::PropertiesFile::storeAsXML;
+    options.millisecondsBeforeSaving = 2500;
+
+    // load default patch
+    auto defaultPatchIdx = resetLastLoadedProgramByName(utils->getDefaultPatch().toStdString());
+
+    if (defaultPatchIdx > -1)
+    {
+        utils->loadPatch(utils->patchesAsLinearList[defaultPatchIdx]);
+    }
+}
+#endif
+
+ObxfAudioProcessor::~ObxfAudioProcessor() = default;
+
+void ObxfAudioProcessor::prepareToPlay(const double sampleRate, const int /*samplesPerBlock*/)
+{
+    midiHandler.prepareToPlay();
+
+    auto &ph = paramCoordinator->getParameterUpdateHandler();
+
+    ph.setSuppressGestureToUndo(true);
+    ph.updateParameters(true);
+    ph.setSuppressGestureToUndo(false);
+
+    synth.setSampleRate(static_cast<float>(sampleRate));
+    midiHandler.setSampleRate(sampleRate);
+}
+
+void ObxfAudioProcessor::processBlock(juce::AudioBuffer<float> &buffer,
+                                      juce::MidiBuffer &midiMessages)
+{
+    juce::ScopedNoDenormals noDenormals;
+
+    paramCoordinator->getParameterUpdateHandler().updateParameters();
+
+    {
+        auto *mb = synth.getMotherboard();
+        auto &vm = mb->voiceMatrix;
+        bool rowsChanged{false};
+
+        while (matrixFifo.hasElement()) [[unlikely]]
+        {
+            auto update = matrixFifo.pop();
+
+            if (update.index >= 0 && update.index < NUM_MATRIX_ROWS)
+            {
+                vm.rows[update.index] = update.row;
+                rowsChanged = true;
+            }
+        }
+
+        // matrix results are cached per voice, so an edited row has to be re-evaluated
+        if (rowsChanged) [[unlikely]]
+        {
+            mb->recalculateAllMatrices();
+        }
+    }
+
+    int samplePos = 0;
+    const int numSamples = buffer.getNumSamples();
+    float *channelData1 = buffer.getWritePointer(0);
+    float *channelData2 = (buffer.getNumChannels() > 1) ? buffer.getWritePointer(1) : channelData1;
+
+    bool gotTransportInfo{false};
+    if (const auto *playHead = getPlayHead())
+    {
+        if (auto position = playHead->getPosition())
+        {
+            if (position->getBpm() && position->getPpqPosition())
+            {
+                gotTransportInfo = true;
+                auto p = *(position->getPpqPosition());
+                auto b = *(position->getBpm());
+                bool resetPosition = false;
+
+                if ((!wasPlayingLastFrame && position->getIsPlaying()) || (p < lastPPQPosition))
+                {
+                    resetPosition = true;
+                }
+
+                wasPlayingLastFrame = position->getIsPlaying();
+                lastPPQPosition = p;
+                synth.setPlayHead(b, p, resetPosition);
+            }
+        }
+    }
+
+    if (!gotTransportInfo)
+    {
+        bool resetPosition = false;
+        if (!wasPlayingLastFrame || syntheticPPQPosition < 0)
+        {
+            wasPlayingLastFrame = true;
+            resetPosition = true;
+        }
+        auto b = 120.0;
+        if (syntheticPPQPosition < 0)
+        {
+            syntheticPPQPosition = 0;
+        }
+        else
+        {
+            syntheticPPQPosition += buffer.getNumSamples() * b / (60 * getSampleRate());
+        }
+        synth.setPlayHead(b, syntheticPPQPosition, resetPosition);
+    }
+
+    auto it = midiMessages.begin();
+    bool hasMidiMessage = (it != midiMessages.end());
+
+    synth.getMotherboard()->tuning.updateMTSESPStatus();
+
+    while (samplePos < numSamples)
+    {
+        if (hasMidiMessage)
+        {
+            midiHandler.processMidiPerSample(&it, midiMessages, samplePos);
+            hasMidiMessage = (it != midiMessages.end());
+        }
+
+        midiHandler.processLags();
+        synth.processSample(channelData1 + samplePos, channelData2 + samplePos);
+
+        ++samplePos;
+    }
+
+    assert(!hasMidiMessage);
+
+    // Consume any events timestamped at or beyond the block end.
+    // This should never happen in a well-behaving host!
+    while (hasMidiMessage)
+    {
+        midiHandler.processMidiPerSample(&it, midiMessages, samplePos);
+        hasMidiMessage = (it != midiMessages.end());
+    }
+
+    if (uiState.editorAttached)
+    {
+        uiState.lastUpdate += numSamples;
+        if (uiState.lastUpdate >= uiState.updateInterval)
+        {
+            uiState.lastUpdate = 0;
+            updateUIState();
+        }
+    }
+}
+
+#ifndef JucePlugin_PreferredChannelConfigurations
+bool ObxfAudioProcessor::isBusesLayoutSupported(const BusesLayout &layouts) const
+{
+#if JucePlugin_IsMidiEffect
+    juce::ignoreUnused(layouts);
+    return true;
+#else
+    if (layouts.getMainOutputChannelSet() != juce::AudioChannelSet::mono() &&
+        layouts.getMainOutputChannelSet() != juce::AudioChannelSet::stereo())
+        return false;
+#if !JucePlugin_IsSynth
+    if (layouts.getMainOutputChannelSet() != layouts.getMainInputChannelSet())
+        return false;
+#endif
+
+    return true;
+#endif
+}
+#endif
+
+//==============================================================================
+void ObxfAudioProcessor::releaseResources() {}
+
+const juce::String ObxfAudioProcessor::getName() const { return JucePlugin_Name; }
+
+bool ObxfAudioProcessor::acceptsMidi() const
+{
+#if JucePlugin_WantsMidiInput
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool ObxfAudioProcessor::producesMidi() const
+{
+#if JucePlugin_ProducesMidiOutput
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool ObxfAudioProcessor::isMidiEffect() const { return false; }
+double ObxfAudioProcessor::getTailLengthSeconds() const { return 0.0; }
+
+int ObxfAudioProcessor::getNumPrograms() { return 1; }
+int ObxfAudioProcessor::getCurrentProgram() { return 0; }
+void ObxfAudioProcessor::setCurrentProgram(const int index)
+{
+    if (stateHasBeenLoaded.load())
+    {
+        return;
+    }
+
+    if (index < 0 || index > utils->lastFactoryPatch + 1 ||
+        (size_t)index > utils->patchesAsLinearList.size())
+    {
+        return;
+    }
+
+    currentDawProgram = index;
+
+    if (index == 0)
+    {
+        utils->initializePatch();
+        processActiveProgramChanged();
+    }
+    else
+    {
+        utils->loadPatch(utils->patchesAsLinearList[index - 1]);
+    }
+}
+const juce::String ObxfAudioProcessor::getProgramName(const int index)
+{
+    if (index < 0 || index > utils->lastFactoryPatch ||
+        (size_t)index > utils->patchesAsLinearList.size())
+        return "ERR";
+    if (index == 0)
+        return INIT_PATCH_NAME;
+    return utils->patchesAsLinearList[index - 1]->displayName;
+}
+
+void ObxfAudioProcessor::applyActiveProgramValuesToJUCEParameters()
+{
+    juce::ScopedValueSetter<bool> svs(isHostAutomatedChange, false);
+
+    auto &ph = paramCoordinator->getParameterUpdateHandler();
+
+    if (!ph.isFIFOClear())
+    {
+        OBLOG(params, "Deferring applying for update");
+        juce::Timer::callAfterDelay(50, [this]() { applyActiveProgramValuesToJUCEParameters(); });
+        return;
+    }
+
+    ph.setSuppressGestureToUndo(true);
+
+    const Program &prog = activeProgram;
+
+    for (auto *param : ObxfParams(*this))
+    {
+        if (param)
+        {
+            const auto &paramId = param->paramID;
+            auto it = prog.values.find(paramId);
+            const float value =
+                (it != prog.values.end()) ? it->second.load() : param->meta.defaultVal;
+
+            auto v = param->convertTo0to1(param->get());
+
+            if (v != value)
+            {
+                param->setValueNotifyingHost(value);
+            }
+        }
+    }
+
+    updateHostDisplay(juce::AudioProcessor::ChangeDetails().withNonParameterStateChanged(true));
+
+    ph.setSuppressGestureToUndo(false);
+}
+
+void ObxfAudioProcessor::processActiveProgramChanged()
+{
+    applyActiveProgramValuesToJUCEParameters();
+    sendChangeMessageWithUndoSuppressed();
+}
+
+void ObxfAudioProcessor::sendChangeMessageWithUndoSuppressed()
+{
+    auto &ph = paramCoordinator->getParameterUpdateHandler();
+
+    if (juce::MessageManager::existsAndIsCurrentThread())
+    {
+        // we can trigger the listeners synchronously
+        ph.setSuppressGestureToUndo(true);
+        sendSynchronousChangeMessage();
+        ph.setSuppressGestureToUndo(false);
+    }
+    else
+    {
+        // We know the message queue is ordered so this should toggle
+        // around the send change message.
+        juce::MessageManager::callAsync([&ph]() { ph.setSuppressGestureToUndo(true); });
+        sendChangeMessage();
+        juce::MessageManager::callAsync([&ph]() { ph.setSuppressGestureToUndo(false); });
+    }
+}
+
+#ifndef OBXF_HEADLESS
+bool ObxfAudioProcessor::hasEditor() const { return true; }
+
+juce::AudioProcessorEditor *ObxfAudioProcessor::createEditor()
+{
+    return new ObxfAudioProcessorEditor(*this);
+}
+#endif
+
+void ObxfAudioProcessor::setEngineParameterValue(const juce::String &paramId, float newValue,
+                                                 bool notifyToHost)
+{
+    paramCoordinator->setEngineParameterValue(synth, paramId, newValue, notifyToHost);
+}
+
+void ObxfAudioProcessor::handleMIDIProgramChange(const int programNumber)
+{
+    if (utils->firstMidiProgram > -1 && programNumber < utils->numMidiPrograms)
+    {
+        utils->loadPatch(utils->patchesAsLinearList[utils->firstMidiProgram + programNumber]);
+        processActiveProgramChanged();
+    }
+}
+
+void ObxfAudioProcessor::getStateInformation(juce::MemoryBlock &destData)
+{
+    midiHandler.snapLags();
+    state->collectDAWExtraStateFromInstance();
+    state->getPluginStateInformation(destData);
+}
+
+void ObxfAudioProcessor::setStateInformation(const void *data, const int sizeInBytes)
+{
+    auto &ph = paramCoordinator->getParameterUpdateHandler();
+
+    ph.setSuppressGestureToUndo(true);
+    state->setPluginStateInformation(data, sizeInBytes);
+    state->applyDAWExtraStateToInstance();
+    ph.setSuppressGestureToUndo(false);
+
+    auto pn = activeProgram.getName();
+
+    if (pn.isEmpty())
+    {
+        pn = INIT_PATCH_NAME;
+    }
+
+    resetLastLoadedProgramByName(pn.toStdString());
+
+    stateHasBeenLoaded.store(true);
+}
+
+int ObxfAudioProcessor::resetLastLoadedProgramByName(const std::string &nm,
+                                                     const bool searchOnlyUser)
+{
+    OBLOG(patches, "Traversing patch list to find '" << nm << "'");
+
+    for (auto i = 0U; i < utils->patchesAsLinearList.size(); ++i)
+    {
+        if (utils->patchesAsLinearList[i]->displayName.toStdString() == nm &&
+            (!searchOnlyUser || (searchOnlyUser && utils->patchesAsLinearList[i]->locationType ==
+                                                       Utils::LocationType::USER)))
+        {
+            resetLastLoadedProgramTo(i);
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+void ObxfAudioProcessor::resetLastLoadedProgramTo(int idx)
+{
+    lastLoadedProgram = idx;
+    if (idx >= 0 && idx < (int)utils->patchesAsLinearList.size())
+        lastLoadedPatchNode = utils->patchesAsLinearList[idx];
+    else
+        lastLoadedPatchNode.reset();
+}
+
+void ObxfAudioProcessor::initializeLockCallbacks()
+{
+    auto &ph = paramCoordinator->getParameterUpdateHandler();
+
+    ph.addParameterCallback(ID::HQMode, "LOCK", [this](float value, bool) {
+        if (lockHighQuality.load())
+        {
+            lockedHQ = (value >= 0.5f);
+        }
+    });
+
+    ph.addParameterCallback(ID::BendUpRange, "LOCK", [this, &ph](float value, bool) {
+        if (lockPitchBend.load())
+        {
+            auto *param = ph.getParameter(ID::BendUpRange);
+            if (param)
+                lockedPBUpRange = static_cast<int>(param->convertFrom0to1(value));
+        }
+    });
+
+    ph.addParameterCallback(ID::BendDownRange, "LOCK", [this, &ph](float value, bool) {
+        if (lockPitchBend.load())
+        {
+            auto *param = ph.getParameter(ID::BendDownRange);
+            if (param)
+                lockedPBDownRange = static_cast<int>(param->convertFrom0to1(value));
+        }
+    });
+}
+
+void ObxfAudioProcessor::initializeMidiCallbacks()
+{
+    midiHandler.handleMIDIProgramChangeCallback = [this](const int programNumber) {
+        handleMIDIProgramChange(programNumber);
+    };
+    midiHandler.onMidiMessageCallback = [](const juce::MidiMessage &) {
+
+    };
+}
+
+void ObxfAudioProcessor::initializeUtilsCallbacks()
+{
+    utils->hostUpdateCallback = [this](int idx) {
+        resetLastLoadedProgramTo(idx);
+        if (idx < (int)utils->lastFactoryPatch)
+        {
+            currentDawProgram = idx + 1;
+            OBLOG(patches, "set currentDawProgram to " << currentDawProgram);
+            updateHostDisplay(
+                juce::AudioProcessor::ChangeDetails().withNonParameterStateChanged(true));
+        }
+    };
+
+    utils->loadMemoryBlockCallback = [this](juce::MemoryBlock &mb) {
+        return state->loadFromMemoryBlock(mb);
+    };
+
+    utils->loadMemoryBlockOntoProgramCallback = [this](juce::MemoryBlock &mb, Program &program) {
+        return state->loadFromMemoryBlockOntoProgram(mb, program);
+    };
+
+    utils->getProgramStateInformation = [this](juce::MemoryBlock &mb) {
+        state->getProgramStateInformation(mb);
+    };
+
+    utils->copyTruncatedProgramNameToFXPBuffer = [this](char *buffer, const int maxSize) {
+        activeProgram.getName().copyToUTF8(buffer, maxSize);
+    };
+
+    utils->resetPatchToDefault = [this]() {
+        activeProgram.setToDefaultPatch();
+        // we send here since with other patch loads we send
+        // inside setStateInformation
+        sendChangeMessage();
+    };
+}
+
+void ObxfAudioProcessor::initializeCallbacks()
+{
+    initializeLockCallbacks();
+    initializeMidiCallbacks();
+    initializeUtilsCallbacks();
+}
+
+void ObxfAudioProcessor::mutatePatch()
+{
+    std::vector<std::pair<juce::String, float>> before;
+    before.reserve(activeProgram.values.size());
+
+    for (auto &p : activeProgram.values)
+    {
+        before.emplace_back(p.first, p.second.load());
+    }
+
+    paramCoordinator->getParameterUpdateHandler().recordUndoableAction([this, before] {
+        for (auto &[id, val] : before)
+            activeProgram.setValueById(id, val);
+
+        processActiveProgramChanged();
+        sendChangeMessage();
+    });
+
+    paramAlgos->mutate(activeProgram, mutateSections);
+    processActiveProgramChanged();
+    sendChangeMessage();
+}
+
+void ObxfAudioProcessor::randomizePatch()
+{
+    paramAlgos->randomize();
+    sendChangeMessage();
+}
+
+void ObxfAudioProcessor::panSetter(PanAlgos alg)
+{
+    paramAlgos->voicePanSetter(alg);
+    sendChangeMessage();
+}
+
+void ObxfAudioProcessor::updateUIState()
+{
+    for (int i = 0; i < MAX_VOICES; ++i)
+    {
+        uiState.voiceStatusValue[i] = synth.getVoiceAmpEnvStatus(i);
+    }
+}
+
+void ObxfAudioProcessor::setMpeEnabled(bool enabled)
+{
+    midiHandler.mpeEnabled.store(enabled);
+    synth.getMotherboard()->mpeEnabled = enabled;
+
+    // reset MPE pitch and timbre when disabling MPE
+    // else this would only reset on note release, which is uncool
+    if (!enabled)
+    {
+        synth.processMPEPitch(-1, 0.f);
+        synth.processMPETimbre(-1, 0.f);
+    }
+
+    sendChangeMessage();
+}
+
+void ObxfAudioProcessor::setMpePitchBendRange(int range)
+{
+    midiHandler.mpePitchBendRange.store(range);
+    synth.getMotherboard()->mpePitchBendRange = range;
+
+    sendChangeMessage();
+}
+
+void ObxfAudioProcessor::setGlobalPitchBendRange(int range)
+{
+    const int st = std::clamp(range, 0, MAX_BEND_RANGE);
+
+    synth.processBendUpRange(st);
+    synth.processBendDownRange(st);
+
+    sendChangeMessage();
+}
+
+void ObxfAudioProcessor::pushMatrixRowUpdate(int idx, const MatrixRow &row)
+{
+    matrixFifo.push(idx, row);
+}
+
+//==============================================================================
+
+juce::AudioProcessor *JUCE_CALLTYPE createPluginFilter() { return new ObxfAudioProcessor(); }

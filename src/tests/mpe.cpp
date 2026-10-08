@@ -1,0 +1,562 @@
+/*
+ * OB-Xd was originally written by Vadim Filatov, and then a version
+ * was released under the GPL3 at https://github.com/reales/OB-Xd.
+ * Subsequently, the product was continued by DiscoDSP and the copyright
+ * holders as an excellent closed source product.
+ *
+ * This repository is a successor to OB-Xd version 2.11.
+ * Copyright 2013-2025 by the authors as indicated in the original release,
+ * and subsequent authors as per GitHub transaction log.
+ *
+ * OB-Xf is released under the GNU General Public Licence v3 or later
+ * (GPL-3.0-or-later). The license is found in the file "LICENSE"
+ * in the root of this repository or at:
+ * https://www.gnu.org/licenses/gpl-3.0.en.html
+ *
+ * Source code is available at https://github.com/surge-synthesizer/OB-Xf
+ */
+
+/*
+ * Include SynthEngine.h first so the include chain resolves correctly —
+ * same pattern as osc.cpp and filt.cpp.
+ */
+#include "SynthEngine.h"
+
+#define CATCH_CONFIG_ENABLE_BENCHMARKING
+#include <catch2/catch2.hpp>
+
+#include <cmath>
+#include <string>
+
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+/* Approximate equality. */
+static bool approxEq(float a, float b, float tol = 1e-5f) { return std::abs(a - b) <= tol; }
+
+/* Minimal engine set up for MPE testing. Polyphony=8, mpeEnabled=true. */
+struct MpeEngine
+{
+    SynthEngine eng;
+    Motherboard *mb;
+
+    MpeEngine()
+    {
+        eng.setSampleRate(44100.f);
+        mb = eng.getMotherboard();
+        mb->setPolyphony(8);
+        mb->mpeEnabled = true;
+    }
+
+    /* First gated voice on the given channel, or nullptr. */
+    Voice *gatedOnChannel(int8_t ch) const
+    {
+        for (int i = 0; i < MAX_VOICES; ++i)
+            if (mb->voices[i].isGated() && mb->voices[i].channel == ch)
+                return &mb->voices[i];
+        return nullptr;
+    }
+
+    /* Total number of currently gated voices. */
+    int gatedCount() const
+    {
+        int n = 0;
+        for (int i = 0; i < MAX_VOICES; ++i)
+            if (mb->voices[i].isGated())
+                ++n;
+        return n;
+    }
+};
+
+// ===========================================================================
+// Layer 1: Pure VoiceMatrix unit tests (no engine required)
+// ===========================================================================
+
+TEST_CASE("VoiceMatrix: single row Strike->FilterCutoff depth 0.5, source 1.0", "[VoiceMatrix]")
+{
+    VoiceMatrix vm;
+    REQUIRE(vm.setModulation("Strike", SynthParam::ID::FilterCutoff, 0.5f, 0));
+
+    VoiceMatrixSourceValues src;
+    src.velocity = 1.0f;
+    VoiceMatrixBases bases;
+    VoiceMatrixAdjustments adj;
+    recalculateMatrix(vm, bases, src, adj);
+
+    /* contribution = 1.0 * 0.5 = 0.5 in normalized parameter space */
+    REQUIRE(approxEq(adj.modFor(MatrixTarget::FilterCutoff), 0.5f));
+    REQUIRE(approxEq(adj.modFor(MatrixTarget::FilterResonance), 0.f));
+    REQUIRE(approxEq(adj.modFor(MatrixTarget::Osc1Pitch), 0.f));
+}
+
+TEST_CASE("VoiceMatrix: two rows targeting the same param accumulate", "[VoiceMatrix]")
+{
+    VoiceMatrix vm;
+    REQUIRE(vm.setModulation("Strike", SynthParam::ID::FilterCutoff, 0.3f, 0));
+    REQUIRE(vm.setModulation("Slide", SynthParam::ID::FilterCutoff, 0.4f, 1));
+
+    VoiceMatrixSourceValues src;
+    src.velocity = 1.0f;
+    src.timbre = 1.0f;
+    VoiceMatrixBases bases;
+    VoiceMatrixAdjustments adj;
+    recalculateMatrix(vm, bases, src, adj);
+
+    REQUIRE(approxEq(adj.modFor(MatrixTarget::FilterCutoff), 0.7f)); /* 0.3 + 0.4 */
+}
+
+TEST_CASE("VoiceMatrix: depth zero contributes nothing", "[VoiceMatrix]")
+{
+    VoiceMatrix vm;
+    REQUIRE(vm.setModulation("Strike", SynthParam::ID::FilterCutoff, 0.f, 0));
+
+    VoiceMatrixSourceValues src;
+    src.velocity = 1.0f;
+    VoiceMatrixBases bases;
+    VoiceMatrixAdjustments adj;
+    recalculateMatrix(vm, bases, src, adj);
+
+    REQUIRE(approxEq(adj.modFor(MatrixTarget::FilterCutoff), 0.f));
+}
+
+TEST_CASE("VoiceMatrix: source value zero contributes nothing", "[VoiceMatrix]")
+{
+    VoiceMatrix vm;
+    REQUIRE(vm.setModulation("Strike", SynthParam::ID::FilterCutoff, 1.0f, 0));
+
+    VoiceMatrixSourceValues src; /* velocity defaults to 0 */
+    VoiceMatrixBases bases;
+    VoiceMatrixAdjustments adj;
+    recalculateMatrix(vm, bases, src, adj);
+
+    REQUIRE(approxEq(adj.modFor(MatrixTarget::FilterCutoff), 0.f));
+}
+
+TEST_CASE("VoiceMatrix: negative depth inverts the adjustment", "[VoiceMatrix]")
+{
+    VoiceMatrix vm;
+    REQUIRE(vm.setModulation("Strike", SynthParam::ID::FilterCutoff, -0.5f, 0));
+
+    VoiceMatrixSourceValues src;
+    src.velocity = 1.0f;
+    VoiceMatrixBases bases;
+    VoiceMatrixAdjustments adj;
+    recalculateMatrix(vm, bases, src, adj);
+
+    REQUIRE(approxEq(adj.modFor(MatrixTarget::FilterCutoff), -0.5f));
+}
+
+// ---------------------------------------------------------------------------
+// Scaling: depth is normalized, so it follows the target's own curve and range
+// ---------------------------------------------------------------------------
+
+/* Run one full-depth row and return the resulting native value for the target. */
+static float nativeForFullDepth(const std::string &target, float base, float depth)
+{
+    VoiceMatrix vm;
+    REQUIRE(vm.setModulation("Strike", target, depth, 0));
+
+    VoiceMatrixSourceValues src;
+    src.velocity = 1.0f;
+    VoiceMatrixBases bases;
+    bases.set(matrixTargetFromString(target), base);
+    VoiceMatrixAdjustments adj;
+    recalculateMatrix(vm, bases, src, adj);
+
+    return adj.nativeOr(matrixTargetFromString(target), -12345.f);
+}
+
+TEST_CASE("VoiceMatrix: full depth from zero base reaches the target maximum exactly",
+          "[VoiceMatrix][scaling]")
+{
+    /* Linear target */
+    REQUIRE(approxEq(nativeForFullDepth(SynthParam::ID::Osc1Vol, 0.f, 1.f), 1.f));
+
+    /* Log target: must land on logsc(1) == the parameter maximum, not base + a constant.
+     * Relative comparison, since 1e-5 absolute is meaningless at 60000 ms. */
+    REQUIRE(nativeForFullDepth(SynthParam::ID::AmpEnvRelease, 0.f, 1.f) == Approx(60000.f));
+    REQUIRE(nativeForFullDepth(SynthParam::ID::LFO2Rate, 0.f, 1.f) == Approx(250.f));
+    REQUIRE(approxEq(nativeForFullDepth(SynthParam::ID::UnisonDetune, 0.f, 1.f), 1.f));
+}
+
+TEST_CASE("VoiceMatrix: modulation is clamped to the target's natural range",
+          "[VoiceMatrix][scaling]")
+{
+    /* Down from a mid base overshoots the bottom and clamps to the minimum */
+    REQUIRE(approxEq(nativeForFullDepth(SynthParam::ID::AmpEnvRelease, 0.5f, -1.f), 8.f));
+    REQUIRE(approxEq(nativeForFullDepth(SynthParam::ID::Osc1Vol, 0.5f, -1.f), 0.f));
+
+    /* Up from a mid base overshoots the top and clamps to the maximum */
+    REQUIRE(approxEq(nativeForFullDepth(SynthParam::ID::Osc1Vol, 0.5f, 1.f), 1.f));
+    REQUIRE(approxEq(nativeForFullDepth(SynthParam::ID::OscPW, 0.5f, 1.f), 0.95f));
+}
+
+TEST_CASE("VoiceMatrix: log targets scale along their curve, not linearly",
+          "[VoiceMatrix][scaling]")
+{
+    /* Half depth on a 900-rolloff envelope time must be far below the linear midpoint;
+     * this is precisely what the old fixed-native-range scaling got wrong. */
+    const auto half = nativeForFullDepth(SynthParam::ID::AmpEnvRelease, 0.f, 0.5f);
+
+    REQUIRE(half > 8.f);
+    REQUIRE(half < 2000.f);
+    REQUIRE(approxEq(half, logsc(0.5f, 8.f, 60000.f, 900.f)));
+}
+
+TEST_CASE("VoiceMatrix: pitch is unclamped and bipolar around the patch value",
+          "[VoiceMatrix][scaling]")
+{
+    /* Pitch is the one target that may leave its natural range: at a base of 0 semitones
+     * a negative depth still swings down a full 48 semitones. */
+    REQUIRE_FALSE(matrixTargetScaling(MatrixTarget::Osc1Pitch).clampToRange);
+    REQUIRE(approxEq(nativeForFullDepth(SynthParam::ID::Osc1Pitch, 0.f, -1.f), -48.f));
+    REQUIRE(approxEq(nativeForFullDepth(SynthParam::ID::Osc1Pitch, 0.f, 1.f), 48.f));
+
+    /* Everything else clamps by default */
+    REQUIRE(matrixTargetScaling(MatrixTarget::OscCrossmod).clampToRange);
+    REQUIRE(approxEq(nativeForFullDepth(SynthParam::ID::OscCrossmod, 0.f, -1.f), 0.f));
+}
+
+TEST_CASE("VoiceMatrix: OscPitch drives both oscillators alongside their own rows",
+          "[VoiceMatrix][scaling]")
+{
+    VoiceMatrix vm;
+    REQUIRE(vm.setModulation("Strike", SynthParam::ID::OscPitch, 0.25f, 0));
+    REQUIRE(vm.setModulation("Strike", SynthParam::ID::Osc1Pitch, 0.25f, 1));
+
+    VoiceMatrixSourceValues src;
+    src.velocity = 1.0f;
+    VoiceMatrixBases bases;
+    VoiceMatrixAdjustments adj;
+    recalculateMatrix(vm, bases, src, adj);
+
+    /* Osc1 gets both rows, Osc2 gets only the shared one */
+    REQUIRE(approxEq(adj.nativeOr(MatrixTarget::Osc1Pitch, -1.f), 0.5f * 48.f));
+    REQUIRE(approxEq(adj.nativeOr(MatrixTarget::Osc2Pitch, -1.f), 0.25f * 48.f));
+}
+
+TEST_CASE("VoiceMatrix: an unmodulated target stays inactive so the voice keeps its own value",
+          "[VoiceMatrix][scaling]")
+{
+    VoiceMatrix vm;
+    REQUIRE(vm.setModulation("Strike", SynthParam::ID::Osc1Vol, 0.5f, 0));
+
+    VoiceMatrixSourceValues src;
+    src.velocity = 1.0f;
+    VoiceMatrixBases bases;
+    VoiceMatrixAdjustments adj;
+    recalculateMatrix(vm, bases, src, adj);
+
+    REQUIRE(adj.isActive(MatrixTarget::Osc1Vol));
+    REQUIRE_FALSE(adj.isActive(MatrixTarget::Osc2Vol));
+    REQUIRE(approxEq(adj.nativeOr(MatrixTarget::Osc2Vol, 0.42f), 0.42f));
+
+    /* Cutoff and resonance are applied from mod[] at their consumption site, so they
+     * never report a precomputed native value */
+    REQUIRE_FALSE(adj.isActive(MatrixTarget::FilterCutoff));
+    REQUIRE_FALSE(adj.isActive(MatrixTarget::FilterResonance));
+}
+
+TEST_CASE("VoiceMatrix: setModulation rejects unknown source string", "[VoiceMatrix]")
+{
+    VoiceMatrix vm;
+    REQUIRE_FALSE(vm.setModulation("Aftertouch", SynthParam::ID::FilterCutoff, 1.f, 0));
+    REQUIRE_FALSE(vm.rows[0].isActive());
+}
+
+TEST_CASE("VoiceMatrix: setModulation rejects unknown target string", "[VoiceMatrix]")
+{
+    VoiceMatrix vm;
+    REQUIRE_FALSE(vm.setModulation("Strike", "NonExistentParam", 1.f, 0));
+    REQUIRE_FALSE(vm.rows[0].isActive());
+}
+
+TEST_CASE("VoiceMatrix: setModulation rejects out-of-range index", "[VoiceMatrix]")
+{
+    VoiceMatrix vm;
+    REQUIRE_FALSE(vm.setModulation("Strike", SynthParam::ID::FilterCutoff, 1.f, NUM_MATRIX_ROWS));
+    REQUIRE_FALSE(vm.setModulation("Strike", SynthParam::ID::FilterCutoff, 1.f, -1));
+}
+
+TEST_CASE("VoiceMatrix: XML round-trip preserves all active rows", "[VoiceMatrix]")
+{
+    VoiceMatrix vm;
+    REQUIRE(vm.setModulation("Strike", SynthParam::ID::FilterCutoff, 0.5f, 0));
+    REQUIRE(vm.setModulation("Slide", SynthParam::ID::Osc1Pitch, -0.3f, 1));
+    REQUIRE(vm.setModulation("Press", SynthParam::ID::FilterResonance, 0.7f, 2));
+
+    auto el = vm.toElement();
+
+    VoiceMatrix vm2;
+    vm2.fromElement(el.get());
+
+    REQUIRE(vm2.rows[0].source == MatrixSource::Strike);
+    REQUIRE(vm2.rows[0].target == MatrixTarget::FilterCutoff);
+    REQUIRE(approxEq(vm2.rows[0].depth, 0.5f));
+
+    REQUIRE(vm2.rows[1].source == MatrixSource::Slide);
+    REQUIRE(vm2.rows[1].target == MatrixTarget::Osc1Pitch);
+    REQUIRE(approxEq(vm2.rows[1].depth, -0.3f));
+
+    REQUIRE(vm2.rows[2].source == MatrixSource::Press);
+    REQUIRE(vm2.rows[2].target == MatrixTarget::FilterResonance);
+    REQUIRE(approxEq(vm2.rows[2].depth, 0.7f));
+
+    /* Unused rows remain inactive */
+    for (int i = 3; i < NUM_MATRIX_ROWS; ++i)
+        REQUIRE_FALSE(vm2.rows[i].isActive());
+}
+
+TEST_CASE("VoiceMatrix: fromElement with nullptr clears all rows", "[VoiceMatrix]")
+{
+    VoiceMatrix vm;
+    REQUIRE(vm.setModulation("Strike", SynthParam::ID::FilterCutoff, 1.f, 0));
+
+    vm.fromElement(nullptr);
+
+    for (int i = 0; i < NUM_MATRIX_ROWS; ++i)
+        REQUIRE_FALSE(vm.rows[i].isActive());
+}
+
+TEST_CASE("VoiceMatrix: clear() resets rows and cache", "[VoiceMatrix]")
+{
+    VoiceMatrix vm;
+    REQUIRE(vm.setModulation("Press", SynthParam::ID::FilterCutoff, 1.f, 0));
+
+    vm.clear();
+
+    for (int i = 0; i < NUM_MATRIX_ROWS; ++i)
+        REQUIRE_FALSE(vm.rows[i].isActive());
+}
+
+TEST_CASE("VoiceMatrix: VoiceMatrixSourceValues get/set round-trips all sources", "[VoiceMatrix]")
+{
+    VoiceMatrixSourceValues src;
+    src.set(MatrixSource::Glide, 0.1f);
+    src.set(MatrixSource::Press, 0.2f);
+    src.set(MatrixSource::Slide, 0.3f);
+    src.set(MatrixSource::Strike, 0.4f);
+    src.set(MatrixSource::Lift, 0.5f);
+
+    REQUIRE(approxEq(src.get(MatrixSource::Glide), 0.1f));
+    REQUIRE(approxEq(src.get(MatrixSource::Press), 0.2f));
+    REQUIRE(approxEq(src.get(MatrixSource::Slide), 0.3f));
+    REQUIRE(approxEq(src.get(MatrixSource::Strike), 0.4f));
+    REQUIRE(approxEq(src.get(MatrixSource::Lift), 0.5f));
+    REQUIRE(approxEq(src.get(MatrixSource::None), 0.f));
+}
+
+// ===========================================================================
+// Layer 2: Motherboard integration tests
+// ===========================================================================
+
+/*
+ * NOTE: NoteOn does not check channel during voice allocation — two notes on
+ * the same pitch number but different channels will retrigger the same voice.
+ * The tests below use different note numbers where channel isolation matters.
+ */
+
+TEST_CASE("MPE: channel is recorded on the voice at NoteOn", "[MPE][Motherboard]")
+{
+    MpeEngine e;
+    e.eng.processNoteOn(60, 0.7f, 5);
+
+    Voice *v = e.gatedOnChannel(5);
+    REQUIRE(v != nullptr);
+    REQUIRE(v->midiNote == 60);
+    REQUIRE(v->channel == 5);
+}
+
+TEST_CASE("MPE: NoteOff on channel releases only that channel's voice", "[MPE][Motherboard]")
+{
+    MpeEngine e;
+    /* Different notes so NoteOn does not retrigger the same voice */
+    e.eng.processNoteOn(60, 0.8f, 2);
+    e.eng.processNoteOn(62, 0.8f, 3);
+
+    REQUIRE(e.gatedCount() == 2);
+
+    e.eng.processNoteOff(60, 0.f, 2);
+
+    REQUIRE(e.gatedOnChannel(2) == nullptr);
+    REQUIRE(e.gatedOnChannel(3) != nullptr);
+}
+
+TEST_CASE("MPE: processMPEPitch sets voiceBend on the matching channel only", "[MPE][Motherboard]")
+{
+    MpeEngine e;
+    e.eng.processNoteOn(60, 0.5f, 2);
+    e.eng.processNoteOn(62, 0.5f, 3);
+
+    e.mb->processMPEPitch(2, 1.0f);
+
+    Voice *v2 = e.gatedOnChannel(2);
+    Voice *v3 = e.gatedOnChannel(3);
+    REQUIRE(v2 != nullptr);
+    REQUIRE(v3 != nullptr);
+
+    REQUIRE(approxEq(v2->matrixSourceValues.voiceBend, 1.0f));
+    REQUIRE(approxEq(v3->matrixSourceValues.voiceBend, 0.f)); /* untouched */
+}
+
+TEST_CASE("MPE: processMPEPitch scales mpeBend by mpePitchBendRange", "[MPE][Motherboard]")
+{
+    MpeEngine e;
+    e.mb->mpePitchBendRange = 48;
+    e.eng.processNoteOn(60, 0.5f, 2);
+
+    e.mb->processMPEPitch(2, 1.0f);
+
+    Voice *v = e.gatedOnChannel(2);
+    REQUIRE(v != nullptr);
+    REQUIRE(approxEq(v->mpeBend, 48.f));
+}
+
+TEST_CASE("MPE: processMPEPitch negative bend produces negative mpeBend", "[MPE][Motherboard]")
+{
+    MpeEngine e;
+    e.mb->mpePitchBendRange = 48;
+    e.eng.processNoteOn(60, 0.5f, 2);
+
+    e.mb->processMPEPitch(2, -1.0f);
+
+    Voice *v = e.gatedOnChannel(2);
+    REQUIRE(v != nullptr);
+    REQUIRE(approxEq(v->mpeBend, -48.f));
+}
+
+TEST_CASE("MPE: processMPETimbre normalises 0..1 to -1..1", "[MPE][Motherboard]")
+{
+    MpeEngine e;
+    e.eng.processNoteOn(60, 0.5f, 4);
+    Voice *v = e.gatedOnChannel(4);
+    REQUIRE(v != nullptr);
+
+    e.mb->processMPETimbre(4, 0.f);
+    REQUIRE(approxEq(v->matrixSourceValues.timbre, -1.f));
+
+    e.mb->processMPETimbre(4, 0.5f);
+    REQUIRE(approxEq(v->matrixSourceValues.timbre, 0.f));
+
+    e.mb->processMPETimbre(4, 1.f);
+    REQUIRE(approxEq(v->matrixSourceValues.timbre, 1.f));
+}
+
+TEST_CASE("MPE: processMPEChannelPressure normalises 0..1 to -1..1", "[MPE][Motherboard]")
+{
+    MpeEngine e;
+    e.eng.processNoteOn(60, 0.5f, 6);
+    Voice *v = e.gatedOnChannel(6);
+    REQUIRE(v != nullptr);
+
+    e.mb->processMPEChannelPressure(6, 0.f);
+    REQUIRE(approxEq(v->matrixSourceValues.channelPressure, 0.f));
+
+    e.mb->processMPEChannelPressure(6, 0.5f);
+    REQUIRE(approxEq(v->matrixSourceValues.channelPressure, 0.5f));
+
+    e.mb->processMPEChannelPressure(6, 1.f);
+    REQUIRE(approxEq(v->matrixSourceValues.channelPressure, 1.f));
+}
+
+TEST_CASE("MPE: velocity is stored in matrixSourceValues at NoteOn", "[MPE][Motherboard]")
+{
+    MpeEngine e;
+
+    e.eng.processNoteOn(60, 1.0f, 2);
+    Voice *v = e.gatedOnChannel(2);
+    REQUIRE(v != nullptr);
+    REQUIRE(approxEq(v->matrixSourceValues.velocity, 1.f));
+    e.eng.processNoteOff(60, 0.f, 2);
+
+    e.eng.processNoteOn(60, 0.5f, 2);
+    Voice *v2 = e.gatedOnChannel(2);
+    REQUIRE(v2 != nullptr);
+    REQUIRE(approxEq(v2->matrixSourceValues.velocity, 0.5f));
+}
+
+TEST_CASE("MPE: release velocity is stored in matrixSourceValues at NoteOff", "[MPE][Motherboard]")
+{
+    MpeEngine e;
+    e.eng.processNoteOn(60, 0.8f, 3);
+    Voice *v = e.gatedOnChannel(3);
+    REQUIRE(v != nullptr);
+
+    /* Capture before NoteOff since the voice ungates */
+    e.eng.processNoteOff(60, 0.5f, 3);
+
+    REQUIRE(approxEq(v->matrixSourceValues.releaseVelocity, 0.5f));
+}
+
+TEST_CASE("MPE: matrix adjustment is computed from velocity immediately at NoteOn",
+          "[MPE][Motherboard]")
+{
+    MpeEngine e;
+    e.mb->voiceMatrix.setModulation("Strike", SynthParam::ID::FilterCutoff, 1.f, 0);
+
+    e.eng.processNoteOn(60, 1.0f, 2);
+    Voice *v = e.gatedOnChannel(2);
+    REQUIRE(v != nullptr);
+
+    /* adj = velocity(1.0) * depth(1.0) = 1.0 */
+    REQUIRE(approxEq(v->matrixAdjustments.modFor(MatrixTarget::FilterCutoff), 1.f));
+}
+
+TEST_CASE("MPE: matrix adjustment updates when an MPE message is received", "[MPE][Motherboard]")
+{
+    MpeEngine e;
+    e.mb->voiceMatrix.setModulation("Slide", SynthParam::ID::FilterCutoff, 1.f, 0);
+
+    e.eng.processNoteOn(60, 0.5f, 2);
+    Voice *v = e.gatedOnChannel(2);
+    REQUIRE(v != nullptr);
+
+    /* Full timbre: normalised = 2*1.0 - 1 = 1.0 → adj = 1.0 * 1.0 = 1.0 */
+    e.mb->processMPETimbre(2, 1.f);
+    REQUIRE(approxEq(v->matrixAdjustments.modFor(MatrixTarget::FilterCutoff), 1.f));
+
+    /* Zero timbre: normalised = 2*0.0 - 1 = -1.0 → adj = -1.0 * 1.0 = -1.0 */
+    e.mb->processMPETimbre(2, 0.f);
+    REQUIRE(approxEq(v->matrixAdjustments.modFor(MatrixTarget::FilterCutoff), -1.f));
+}
+
+TEST_CASE("MPE: mpeBend is reset to zero on NoteOn (no bleed from previous note)",
+          "[MPE][Motherboard]")
+{
+    MpeEngine e;
+    e.eng.processNoteOn(60, 0.5f, 2);
+
+    /* Apply a non-zero bend */
+    e.mb->processMPEPitch(2, 1.0f);
+    Voice *v = e.gatedOnChannel(2);
+    REQUIRE(v != nullptr);
+    REQUIRE(v->mpeBend != 0.f);
+
+    /* Release, then retrigger same channel — NoteOn must zero mpeBend */
+    e.eng.processNoteOff(60, 0.f, 2);
+    e.eng.processNoteOn(60, 0.5f, 2);
+
+    Voice *v2 = e.gatedOnChannel(2);
+    REQUIRE(v2 != nullptr);
+    REQUIRE(approxEq(v2->mpeBend, 0.f));
+}
+
+TEST_CASE("MPE: matrix adjustments are cleared on NoteOn", "[MPE][Motherboard]")
+{
+    MpeEngine e;
+    /* Wire Slide → FilterCutoff so adjustments are nonzero after timbre message */
+    e.mb->voiceMatrix.setModulation("Slide", SynthParam::ID::FilterCutoff, 1.f, 0);
+
+    e.eng.processNoteOn(60, 0.5f, 2);
+    e.mb->processMPETimbre(2, 1.f); /* adj.filterCutoff becomes 1.0 */
+
+    e.eng.processNoteOff(60, 0.f, 2);
+    e.eng.processNoteOn(60, 0.5f, 2); /* fresh note: timbre source cleared → adj reset */
+
+    Voice *v = e.gatedOnChannel(2);
+    REQUIRE(v != nullptr);
+    /* Slide source value was cleared; only Strike contributes, not Slide */
+    REQUIRE(approxEq(v->matrixSourceValues.timbre, 0.f));
+    REQUIRE(approxEq(v->matrixAdjustments.modFor(MatrixTarget::FilterCutoff), 0.f));
+}

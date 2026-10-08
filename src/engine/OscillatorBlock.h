@@ -1,16 +1,12 @@
 /*
- * OB-Xf - a continuation of the last open source version of OB-Xd.
- *
  * OB-Xd was originally written by Vadim Filatov, and then a version
  * was released under the GPL3 at https://github.com/reales/OB-Xd.
  * Subsequently, the product was continued by DiscoDSP and the copyright
- * holders as an excellent closed source product. For more info,
- * see "HISTORY.md" in the root of this repository.
+ * holders as an excellent closed source product.
  *
- * This repository is a successor to the last open source release,
- * a version marked as 2.11. Copyright 2013-2025 by the authors
- * as indicated in the original release, and subsequent authors
- * per the GitHub transaction log.
+ * This repository is a successor to OB-Xd version 2.11.
+ * Copyright 2013-2025 by the authors as indicated in the original release,
+ * and subsequent authors as per GitHub transaction log.
  *
  * OB-Xf is released under the GNU General Public Licence v3 or later
  * (GPL-3.0-or-later). The license is found in the file "LICENSE"
@@ -35,9 +31,18 @@
 
 class OscillatorBlock
 {
+  public:
+    enum NoiseColor : int
+    {
+        White = 0,
+        Pink = 1,
+        Red = 2
+    };
+
   private:
-    static constexpr float oneThird = 1.f / 3.f;
-    static constexpr float twoThirds = 2.f / 3.f;
+    using NoiseColorFn = float (Noise::*)();
+    static constexpr NoiseColorFn noiseColorFns[3] = {&Noise::getWhite, &Noise::getPink,
+                                                      &Noise::getRed};
 
     float sampleRate{1.f};
     float sampleRateInv{1.f};
@@ -96,6 +101,7 @@ class OscillatorBlock
             float crossmod{0.f};
             bool sync{false};
 
+            bool keytrack2{true};
         } osc;
 
         struct Mod
@@ -117,7 +123,7 @@ class OscillatorBlock
             float osc2{0.f};
             float ringMod{0.f};
             float noise{0.f};
-            float noiseColor{0.f};
+            int noiseColor{White};
         } mix;
     } par;
 
@@ -166,7 +172,7 @@ class OscillatorBlock
                               par.pitch.transpose + par.pitch.unisonDetune * osc1.tuningSlop);
         bool syncReset = false;
         float syncFrac = 0.f;
-        float fs = juce::jmin(osc1.pitch * sampleRateInv, 0.45f);
+        float fs = std::min(osc1.pitch * sampleRateInv, 0.45f);
 
         osc1.phase += fs;
         syncFrac = 0.f;
@@ -220,11 +226,13 @@ class OscillatorBlock
         // pitch control needs additional delay buffer to compensate
         // this will give us less aliasing on crossmod
         osc2.pitch = getPitch(delay.pitch.feedReturn(
-            par.mod.oscPitchNoise * gen.noise.getWhite() + par.pitch.notePlaying + par.osc.detune +
-            par.osc.pitch2 + par.mod.osc2PitchMod + osc1out * par.osc.crossmod + par.pitch.tune +
-            par.pitch.transpose + par.pitch.unisonDetune * osc2.tuningSlop));
+            par.mod.oscPitchNoise * gen.noise.getWhite() +
+            (par.pitch.notePlaying * par.osc.keytrack2) +
+            (-33.f * (1.f - par.osc.keytrack2)) + // why -33? same reason why it's -93 in Voice.h!
+            par.osc.detune + par.osc.pitch2 + par.mod.osc2PitchMod + osc1out * par.osc.crossmod +
+            par.pitch.tune + par.pitch.transpose + par.pitch.unisonDetune * osc2.tuningSlop));
 
-        fs = juce::jmin(osc2.pitch * sampleRateInv, 0.45f);
+        fs = std::min(osc2.pitch * sampleRateInv, 0.45f);
 
         pwcalc = juce::jlimit<float>(0.1f, 1.f, (par.osc.pw + par.mod.osc2PWMod) * 0.5f + 0.5f);
 
@@ -279,18 +287,7 @@ class OscillatorBlock
         float rmOut = osc1out * osc2out;
         float noise = 0.f;
 
-        if (par.mix.noiseColor < oneThird)
-        {
-            noise = gen.noise.getWhite();
-        }
-        else if (par.mix.noiseColor < twoThirds)
-        {
-            noise = gen.noise.getPink();
-        }
-        else
-        {
-            noise = gen.noise.getRed();
-        }
+        noise = (gen.noise.*noiseColorFns[par.mix.noiseColor])();
 
         // mixing
         float out = (osc1out * par.mix.osc1) + (osc2out * par.mix.osc2) +

@@ -1,16 +1,12 @@
 /*
- * OB-Xf - a continuation of the last open source version of OB-Xd.
- *
  * OB-Xd was originally written by Vadim Filatov, and then a version
  * was released under the GPL3 at https://github.com/reales/OB-Xd.
  * Subsequently, the product was continued by DiscoDSP and the copyright
- * holders as an excellent closed source product. For more info,
- * see "HISTORY.md" in the root of this repository.
+ * holders as an excellent closed source product.
  *
- * This repository is a successor to the last open source release,
- * a version marked as 2.11. Copyright 2013-2025 by the authors
- * as indicated in the original release, and subsequent authors
- * per the GitHub transaction log.
+ * This repository is a successor to OB-Xd version 2.11.
+ * Copyright 2013-2025 by the authors as indicated in the original release,
+ * and subsequent authors as per GitHub transaction log.
  *
  * OB-Xf is released under the GNU General Public Licence v3 or later
  * (GPL-3.0-or-later). The license is found in the file "LICENSE"
@@ -28,6 +24,9 @@
 #include "../src/engine/SynthEngine.h"
 #include "../components/ScalingImageCache.h"
 #include "HasScaleFactor.h"
+#include "LookAndFeel.h"
+
+#include "sst/plugininfra/misc_platform.h"
 
 class ButtonList final : public juce::ComboBox, public HasScaleFactor, public HasParameterWithID
 {
@@ -46,6 +45,8 @@ class ButtonList final : public juce::ComboBox, public HasScaleFactor, public Ha
         h2 = fh;
         w2 = kni.getWidth();
     }
+
+    void setNumColumns(int n) { numColumns = n; }
 
     juce::AudioProcessorParameterWithID *getParameterWithID() override { return parameter; }
 
@@ -133,6 +134,96 @@ class ButtonList final : public juce::ComboBox, public HasScaleFactor, public Ha
         }
     }
 
+    void showPopup() override
+    {
+        juce::PopupMenu menu;
+
+        auto *lf = obxf::obxfLookAndFeel(this);
+
+        if (lf)
+        {
+            menu.setLookAndFeel(lf);
+        }
+
+        if (parameter)
+        {
+            menu.addSectionHeader(parameter->getName(128));
+        }
+        else
+        {
+            menu.addSectionHeader(getTitle());
+        }
+
+        menu.addSeparator();
+
+        for (int i = 0; i < getNumItems(); i++)
+        {
+            auto itemId = getItemId(i);
+            auto text = getItemText(i);
+
+            if (numColumns > 1 && i > 0)
+            {
+                int itemsPerColumn = getNumItems() / numColumns;
+
+                if (i % itemsPerColumn == 0)
+                {
+                    menu.addColumnBreak();
+                    menu.addSectionHeader("#GHOST#");
+                }
+            }
+
+            menu.addItem(text, true, (itemId == getSelectedId()),
+                         [this, itemId]() { setSelectedId(itemId, juce::sendNotification); });
+        }
+
+        if (parameter && owner)
+        {
+            auto editor = owner->getActiveEditor();
+
+            if (editor && obxf::useHostContextMenus(editor))
+            {
+                if (auto *c = editor->getHostContext())
+                {
+                    if (auto menuInfo = c->getContextMenuForParameter(parameter))
+                    {
+                        if (numColumns > 1)
+                        {
+                            menu.addColumnBreak();
+                            menu.addSectionHeader("#GHOST#");
+                        }
+                        else
+                        {
+                            menu.addSeparator();
+                        }
+
+                        auto hostMenu = menuInfo->getEquivalentPopupMenu();
+
+                        if (lf)
+                        {
+                            hostMenu = lf->modifyHostMenu(hostMenu);
+                        }
+
+                        juce::PopupMenu::MenuItemIterator it(hostMenu);
+
+                        while (it.next())
+                        {
+                            menu.addItem(it.getItem());
+                        }
+                    }
+                }
+            }
+        }
+
+        auto options = juce::PopupMenu::Options().withTargetComponent(this);
+
+        menu.showMenuAsync(options, [safe = juce::Component::SafePointer(this)](int) {
+            if (safe)
+            {
+                safe->repaint();
+            }
+        });
+    }
+
     void mouseDown(const juce::MouseEvent &event) override
     {
         if (owner && parameter)
@@ -143,7 +234,44 @@ class ButtonList final : public juce::ComboBox, public HasScaleFactor, public Ha
             }
         }
 
-        ComboBox::mouseDown(event);
+        juce::MessageManager::callAsync([this] { showPopup(); });
+    }
+
+    void mouseWheelMove(const juce::MouseEvent &event,
+                        const juce::MouseWheelDetails &wheel) override
+    {
+        if (wheel.deltaY == 0.f)
+        {
+            return;
+        }
+        else
+        {
+            stepMagnitude = (stepMagnitude == 0.f)
+                                ? std::abs(wheel.deltaY)
+                                : std::min(stepMagnitude, std::abs(wheel.deltaY));
+        }
+
+        wheelAccumulator += wheel.deltaY;
+
+        const float sign = std::signbit(wheel.deltaY) ? 1.f : -1.f;
+
+        while (std::abs(wheelAccumulator) >= stepMagnitude * 0.75f)
+        {
+            wheelAccumulator += sign * stepMagnitude;
+            setSelectedItemIndex(
+                juce::jlimit(0, count - 1, getSelectedItemIndex() + static_cast<int>(sign)),
+                juce::sendNotification);
+        }
+    }
+
+    std::optional<sst::basic_blocks::params::ParamMetaData> getMetadata()
+    {
+        auto op = dynamic_cast<ObxfParameterFloat *>(parameter);
+
+        if (op)
+            return op->meta;
+        else
+            return std::nullopt;
     }
 
   private:
@@ -152,6 +280,9 @@ class ButtonList final : public juce::ComboBox, public HasScaleFactor, public Ha
     int w2, h2;
     juce::AudioProcessorParameterWithID *parameter{nullptr};
     juce::AudioProcessor *owner{nullptr};
+    int numColumns = 1;
+    float wheelAccumulator{0.f};
+    float stepMagnitude{0.f};
 };
 
 #endif // OBXF_SRC_GUI_BUTTONLIST_H

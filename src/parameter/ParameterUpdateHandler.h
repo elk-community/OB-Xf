@@ -1,16 +1,12 @@
 /*
- * OB-Xf - a continuation of the last open source version of OB-Xd.
- *
  * OB-Xd was originally written by Vadim Filatov, and then a version
  * was released under the GPL3 at https://github.com/reales/OB-Xd.
  * Subsequently, the product was continued by DiscoDSP and the copyright
- * holders as an excellent closed source product. For more info,
- * see "HISTORY.md" in the root of this repository.
+ * holders as an excellent closed source product.
  *
- * This repository is a successor to the last open source release,
- * a version marked as 2.11. Copyright 2013-2025 by the authors
- * as indicated in the original release, and subsequent authors
- * per the GitHub transaction log.
+ * This repository is a successor to OB-Xd version 2.11.
+ * Copyright 2013-2025 by the authors as indicated in the original release,
+ * and subsequent authors as per GitHub transaction log.
  *
  * OB-Xf is released under the GNU General Public Licence v3 or later
  * (GPL-3.0-or-later). The license is found in the file "LICENSE"
@@ -28,6 +24,7 @@
 #include <juce_audio_processors/juce_audio_processors.h>
 
 #include "ParameterInfo.h"
+#include "ParameterList.h"
 #include "FIFO.h"
 
 #include <unordered_map>
@@ -46,6 +43,7 @@ class ObxfAudioProcessor;
  *    support UNDO
  * 4. It stores a copy of the ParameterInfo vector
  */
+
 class ParameterUpdateHandler : public juce::AudioProcessorParameter::Listener
 {
   public:
@@ -87,19 +85,40 @@ class ParameterUpdateHandler : public juce::AudioProcessorParameter::Listener
     void addParameter(const juce::String &paramID, juce::RangedAudioParameter *param);
 
     void setSuppressGestureToUndo(bool state) { supressGestureToUndo = state; }
+
+    void recordUndoableAction(std::function<void()> applyFn)
+    {
+        undoStack.push_back({std::move(applyFn)});
+
+        while (undoStack.size() > UNDO_STACK_SIZE)
+        {
+            undoStack.pop_front();
+        }
+    }
+
     void undo();
     // TODO: Redo
     void redo();
 
   private:
-    FIFO<128> fifo;
+    static constexpr int UNDO_STACK_SIZE = 100;
+    static constexpr int FIFO_SIZE = 128;
+
+    FIFO<FIFO_SIZE> fifo;
+
     std::vector<ParameterInfo> parameters;
     ObxfAudioProcessor &audioProcessor;
 
     std::unordered_map<juce::String, std::unordered_map<juce::String, callbackFn_t>> callbacks;
     std::unordered_map<juce::String, juce::RangedAudioParameter *> paramMap;
+    std::vector<juce::String> indexToID;
 
-    std::deque<std::pair<juce::String, float>> undoStack;
+    struct UndoEntry
+    {
+        std::function<void()> apply;
+    };
+
+    std::deque<UndoEntry> undoStack;
 
     /*
      * Note we have a mutex to lock callbacks but it is almost never contested.

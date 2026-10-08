@@ -1,16 +1,12 @@
 /*
- * OB-Xf - a continuation of the last open source version of OB-Xd.
- *
  * OB-Xd was originally written by Vadim Filatov, and then a version
  * was released under the GPL3 at https://github.com/reales/OB-Xd.
  * Subsequently, the product was continued by DiscoDSP and the copyright
- * holders as an excellent closed source product. For more info,
- * see "HISTORY.md" in the root of this repository.
+ * holders as an excellent closed source product.
  *
- * This repository is a successor to the last open source release,
- * a version marked as 2.11. Copyright 2013-2025 by the authors
- * as indicated in the original release, and subsequent authors
- * per the GitHub transaction log.
+ * This repository is a successor to OB-Xd version 2.11.
+ * Copyright 2013-2025 by the authors as indicated in the original release,
+ * and subsequent authors as per GitHub transaction log.
  *
  * OB-Xf is released under the GNU General Public Licence v3 or later
  * (GPL-3.0-or-later). The license is found in the file "LICENSE"
@@ -29,8 +25,7 @@
 #include "SynthEngine.h"
 #include "Lfo.h"
 #include "Tuning.h"
-
-#define DEBUG_VOICE_MANAGER 0
+#include "VoiceMatrix.h"
 
 static constexpr bool ECO_MODE = true;
 
@@ -40,11 +35,13 @@ class Motherboard
     Decimator17 left, right;
 
     VoiceQueue voiceQueue;
+    int lastAllocatedIdx{-1};
 
     int totalVoiceCount{MAX_VOICES};
     int unisonVoiceCount{MAX_PANNINGS};
     bool wasUnisonSet{false};
     int stolenVoicesOnMIDIKey[129]{0};
+    int8_t stolenVoicesChannelForMIDIKey[129]{0};
     int voiceAgeForPriority[129]{0};
 
     int asPlayedCounter{0};
@@ -70,18 +67,35 @@ class Motherboard
     float vibratoAmount{0.f};
     float volume{0.f};
     float pannings[MAX_PANNINGS];
+    bool anySounding{false};
     bool unison{false};
     bool oversample{false};
+    bool reallocate{false};
+    bool mpeEnabled{false};
+    int mpePitchBendRange{48};
 
-#if DEBUG_VOICE_MANAGER
+    VoiceMatrix voiceMatrix;
+    VoiceMatrixBases matrixBases;
+
+    /* Recompute every voice's matrix. Needed when the matrix rows or the base parameter
+     * values change, as opposed to a single voice's sources. */
+    void recalculateAllMatrices()
+    {
+        for (int i = 0; i < totalVoiceCount; i++)
+        {
+            recalculateMatrix(voiceMatrix, matrixBases, voices[i].matrixSourceValues,
+                              voices[i].matrixAdjustments);
+        }
+    }
+
     std::array<int32_t, 128> debugNoteOn{}, debugNoteOff{};
-#endif
 
     Motherboard() : left(), right()
     {
         for (int i = 0; i < 129; i++)
         {
             stolenVoicesOnMIDIKey[i] = 0;
+            stolenVoicesChannelForMIDIKey[i] = 0;
             voiceAgeForPriority[i] = 0;
         }
 
@@ -101,6 +115,7 @@ class Motherboard
         for (int i = 0; i < MAX_VOICES; i++)
         {
             voices[i].initTuning(&tuning);
+            voices[i].voiceIndex = i;
         }
     }
 
@@ -115,6 +130,8 @@ class Motherboard
             totalVoiceCount = newCount;
 
             resetVoiceQueueCount();
+
+            lastAllocatedIdx = -1;
         }
     }
 
@@ -127,6 +144,8 @@ class Motherboard
             unisonVoiceCount = newCount;
 
             resetVoiceQueueCount();
+
+            lastAllocatedIdx = -1;
         }
     }
 
@@ -136,7 +155,7 @@ class Motherboard
 
         for (int i = count; i < MAX_VOICES; i++)
         {
-            voices[i].NoteOff();
+            voices[i].NoteOff(0.f);
             voices[i].ResetEnvelope();
         }
 
@@ -164,8 +183,10 @@ class Motherboard
         SetHQMode(oversample, true);
     }
 
+    bool isSustainOn{false};
     void sustainOn()
     {
+        isSustainOn = true;
         for (int i = 0; i < MAX_VOICES; i++)
         {
             Voice *p = voiceQueue.getNext();
@@ -176,6 +197,7 @@ class Motherboard
 
     void sustainOff()
     {
+        isSustainOn = false;
         for (int i = 0; i < MAX_VOICES; i++)
         {
             Voice *p = voiceQueue.getNext();
@@ -184,53 +206,58 @@ class Motherboard
         }
     }
 
-    void dumpVoiceStatus()
+    void dumpVoiceStatus(const std::string &reason)
     {
-#if DEBUG_VOICE_MANAGER
-        std::ostringstream vposs;
-
-        vposs << "Voice State: mode=";
-        switch (voicePriority)
+        OBLOG(voiceManager, "Dumping voice status: " << reason);
+        if constexpr (obxf_log::voiceManager)
         {
-        case LATEST:
-            vposs << "latest";
-            break;
-        case HIGHEST:
-            vposs << "highest";
-            break;
-        case LOWEST:
-            vposs << "lowest";
-            break;
-        }
+            std::ostringstream vposs;
 
-        DBG(vposs.str());
-
-        for (int i = 0; i < totalVoiceCount; i++)
-        {
-            Voice *p = voiceQueue.getNext();
-
-            if (p->isGated())
+            vposs << "Voice State: mode=";
+            switch (voicePriority)
             {
-                DBG("  active " << p->midiNote << " prio=" << voiceAgeForPriority[p->midiNote]
-                                << " on/off " << debugNoteOn[p->midiNote] << "/"
-                                << debugNoteOff[p->midiNote]);
+            case LATEST:
+                vposs << "latest";
+                break;
+            case HIGHEST:
+                vposs << "highest";
+                break;
+            case LOWEST:
+                vposs << "lowest";
+                break;
             }
-        }
 
-        std::ostringstream oss;
+            OBLOG(voiceManager, vposs.str());
 
-        oss << "  Held Unsounding Keys: ";
-
-        for (int i = 0; i < 129; i++)
-        {
-            if (stolenVoicesOnMIDIKey[i])
+            for (int i = 0; i < totalVoiceCount; i++)
             {
-                oss << i << "->" << stolenVoicesOnMIDIKey[i] << " ";
-            }
-        }
+                Voice *p = voiceQueue.getNext();
 
-        DBG(oss.str());
-#endif
+                if (p->isSounding())
+                {
+                    OBLOG(voiceManager,
+                          "  idx=" << p->voiceIndex << " active " << p->midiNote
+                                   << " prio=" << voiceAgeForPriority[p->midiNote]
+                                   << " snd=" << p->isSounding() << " gt=" << p->isGated()
+                                   << " sus=" << p->isGatedWithSustain() << " on/off "
+                                   << debugNoteOn[p->midiNote] << "/" << debugNoteOff[p->midiNote]);
+                }
+            }
+
+            std::ostringstream oss;
+
+            oss << "  Held Unsounding Keys: ";
+
+            for (int i = 0; i < 129; i++)
+            {
+                if (stolenVoicesOnMIDIKey[i])
+                {
+                    oss << i << "->" << stolenVoicesOnMIDIKey[i] << " ";
+                }
+            }
+
+            OBLOG(voiceManager, oss.str());
+        }
     }
 
     /*
@@ -257,6 +284,7 @@ class Motherboard
             }
         }
 
+        OBLOG(voiceManager, "Voices used: " << va);
         return va;
     }
 
@@ -304,7 +332,7 @@ class Motherboard
         case HIGHEST:
         {
             // Steal the lowest playing voice
-            int mkey{120};
+            int mkey{128};
 
             for (int i = 0; i < totalVoiceCount; i++)
             {
@@ -330,13 +358,13 @@ class Motherboard
         {
         case LATEST:
         {
-            int minPriority = INT_MAX;
+            int maxPriority = INT_MIN;
 
             for (int i = 0; i < 129; i++)
             {
-                if (stolenVoicesOnMIDIKey[i] > 0 && voiceAgeForPriority[i] < minPriority)
+                if (stolenVoicesOnMIDIKey[i] > 0 && voiceAgeForPriority[i] > maxPriority)
                 {
-                    minPriority = voiceAgeForPriority[i];
+                    maxPriority = voiceAgeForPriority[i];
                     res = i;
                 }
             }
@@ -416,11 +444,11 @@ class Motherboard
         return false;
     }
 
-    void setNoteOn(int note, float velocity, int8_t /* channel */)
+    void setNoteOn(int note, float velocity, int8_t channel)
     {
-#if DEBUG_VOICE_MANAGER
+        anySounding = true;
         debugNoteOn[note]++;
-#endif
+
         // This played note has the highest as-played priority
         voiceAgeForPriority[note] = asPlayedCounter++;
 
@@ -434,20 +462,41 @@ class Motherboard
         auto vAvail = voicesAvailable();
         bool should = shouldGivenKeySteal(note);
 
-        /*
-         * First thing - am I actively playing on this key
-         */
+        OBLOG(voiceManager, "NoteOn: " << note << " vAvail=" << vAvail << " voicesNeeded="
+                                       << voicesNeeded << " shouldSteal=" << should);
+
+        // First thing - am I actively playing on this key?
         for (int i = 0; i < totalVoiceCount; i++)
         {
             Voice *v = voiceQueue.getNext();
-            if (v->midiNote == note && v->isGated() && voicesNeeded > 0)
+
+            if (v->midiNote == note && (!mpeEnabled || v->channel == channel) && v->isGated() &&
+                voicesNeeded > 0)
             {
-                v->NoteOn(note, velocity);
+                v->NoteOn(note, velocity, channel);
+                recalculateMatrix(voiceMatrix, matrixBases, v->matrixSourceValues,
+                                  v->matrixAdjustments);
                 voicesNeeded--;
             }
         }
 
-        // Go do some stealing!
+        // reallocate voices played by same keys, as opposed to always round-robin
+        if (reallocate && voicesNeeded > 0)
+        {
+            for (int i = 0; i < totalVoiceCount; i++)
+            {
+                if (voices[i].midiNote == note && voicesNeeded > 0)
+                {
+                    voices[i].NoteOn(note, velocity, channel);
+                    recalculateMatrix(voiceMatrix, matrixBases, voices[i].matrixSourceValues,
+                                      voices[i].matrixAdjustments);
+                    lastAllocatedIdx = i;
+                    voicesNeeded--;
+                }
+            }
+        }
+
+        // Go do some voice stealing!
         while (should && voicesNeeded > vAvail)
         {
             auto voicesToSteal = voicesNeeded;
@@ -459,7 +508,11 @@ class Motherboard
                 auto v = nextVoiceToBeStolen();
 
                 stolenVoicesOnMIDIKey[v->midiNote]++;
-                v->NoteOn(note, velocity);
+                stolenVoicesChannelForMIDIKey[v->midiNote] = v->channel;
+
+                v->NoteOn(note, velocity, channel);
+                recalculateMatrix(voiceMatrix, matrixBases, v->matrixSourceValues,
+                                  v->matrixAdjustments);
                 voicesNeeded--;
 
                 break;
@@ -474,6 +527,8 @@ class Motherboard
 
         if (voicesNeeded && voicesNeeded <= vAvail)
         {
+            voiceQueue.setIdx(lastAllocatedIdx);
+
             // Super simple - just start the voices if they are there.
             // If there aren't enough, we just won't start them
             for (int i = 0; i < totalVoiceCount; i++)
@@ -482,7 +537,10 @@ class Motherboard
 
                 if (!v->isGated())
                 {
-                    v->NoteOn(note, velocity);
+                    v->NoteOn(note, velocity, channel);
+                    recalculateMatrix(voiceMatrix, matrixBases, v->matrixSourceValues,
+                                      v->matrixAdjustments);
+                    lastAllocatedIdx = v->voiceIndex;
                     voicesNeeded--;
 
                     if (voicesNeeded == 0)
@@ -493,30 +551,36 @@ class Motherboard
             }
         }
 
-        dumpVoiceStatus();
+        dumpVoiceStatus("NoteOn");
     }
 
-    void setNoteOff(int note, float /* velocity */, int8_t /* channel */)
+    void setNoteOff(int note, float velocity, int8_t channel)
     {
-#if DEBUG_VOICE_MANAGER
         debugNoteOff[note]++;
-#endif
+
         auto newVoices = voicesPerKey();
 
         // Start by reallocating voices
         auto mk = nextMidiKeyToRealloc();
 
-        if (mk == note) // OK I'm the next key to release so clear me out
+        OBLOG(voiceManager, "NoteOff: " << note << " newv=" << newVoices << " nextMK=" << mk);
+
+        // mk == note: this note is itself the top stolen key, release it directly
+        // mk ==   -1: no stolen keys exist, nothing to realloc — release directly
+        if (mk == note || mk == -1)
         {
             for (int i = 0; i < totalVoiceCount; i++)
             {
                 Voice *v = voiceQueue.getNext();
 
-                if (v->midiNote == note)
+                if (v->midiNote == note && (!mpeEnabled || v->channel == channel))
                 {
-                    v->NoteOff();
+                    v->NoteOff(velocity);
+                    recalculateMatrix(voiceMatrix, matrixBases, v->matrixSourceValues,
+                                      v->matrixAdjustments);
                 }
             }
+
             stolenVoicesOnMIDIKey[note] = 0;
         }
 
@@ -531,7 +595,10 @@ class Motherboard
 
                 if (p->midiNote == note && p->isGated())
                 {
-                    p->NoteOn(mk, Voice::reuseVelocitySentinel);
+                    p->NoteOn(mk, Voice::reuseVelocitySentinel,
+                              mpeEnabled ? stolenVoicesChannelForMIDIKey[mk] : p->channel);
+                    recalculateMatrix(voiceMatrix, matrixBases, p->matrixSourceValues,
+                                      p->matrixAdjustments);
                     stolenVoicesOnMIDIKey[mk]--;
 
                     break;
@@ -541,7 +608,7 @@ class Motherboard
             mk = nextMidiKeyToRealloc();
             newVoices--;
 
-            dumpVoiceStatus();
+            dumpVoiceStatus("Note Off");
         }
 
         // We've released this key so if we do have stolen voices we don't want to bring them back
@@ -552,13 +619,60 @@ class Motherboard
         {
             Voice *v = voiceQueue.getNext();
 
-            if (v->midiNote == note)
+            if (v->midiNote == note && (!mpeEnabled || v->channel == channel))
             {
-                v->NoteOff();
+                v->NoteOff(velocity);
+                recalculateMatrix(voiceMatrix, matrixBases, v->matrixSourceValues,
+                                  v->matrixAdjustments);
             }
         }
 
-        dumpVoiceStatus();
+        dumpVoiceStatus("Note Off (2)");
+    }
+
+    void processMPEPitch(int8_t channel, float pitchBendValue)
+    {
+        // pitchBendValue is -1..1 representing mpePitchBendRange. Scale to semitones with the range
+        const float scaled = pitchBendValue * mpePitchBendRange;
+        for (int i = 0; i < totalVoiceCount; i++)
+        {
+            // isGated not isSounding since long release can reuse channels
+            if ((voices[i].channel == channel || channel == -1) && voices[i].isGated())
+            {
+                voices[i].mpeBend = scaled;
+                setMatrixSource(voices[i].matrixSourceValues, MatrixSource::Glide, pitchBendValue);
+                recalculateMatrix(voiceMatrix, matrixBases, voices[i].matrixSourceValues,
+                                  voices[i].matrixAdjustments);
+            }
+        }
+    }
+
+    void processMPETimbre(int8_t channel, float timbreValue)
+    {
+        // timbreValue is 0..1 (CC74 / 127), normalized to -1..1 for the matrix
+        const float normalised = timbreValue * 2.f - 1.f;
+        for (int i = 0; i < totalVoiceCount; i++)
+        {
+            if ((voices[i].channel == channel || channel == -1) && voices[i].isGated())
+            {
+                setMatrixSource(voices[i].matrixSourceValues, MatrixSource::Slide, normalised);
+                recalculateMatrix(voiceMatrix, matrixBases, voices[i].matrixSourceValues,
+                                  voices[i].matrixAdjustments);
+            }
+        }
+    }
+
+    void processMPEChannelPressure(int8_t channel, float pressureValue)
+    {
+        for (int i = 0; i < totalVoiceCount; i++)
+        {
+            if ((voices[i].channel == channel || channel == -1) && voices[i].isGated())
+            {
+                setMatrixSource(voices[i].matrixSourceValues, MatrixSource::Press, pressureValue);
+                recalculateMatrix(voiceMatrix, matrixBases, voices[i].matrixSourceValues,
+                                  voices[i].matrixAdjustments);
+            }
+        }
     }
 
     void SetHQMode(bool over, bool force = false)
@@ -597,7 +711,7 @@ class Motherboard
             b.lfo1In = lfo1In;
             b.vibratoLFOIn = vibIn;
 
-            return b.ProcessSample();
+            return b.ProcessSample(voiceMatrix);
         }
 
         return 0.f;
@@ -605,23 +719,21 @@ class Motherboard
 
     void processSample(float *sm1, float *sm2)
     {
-        bool anySounding{false};
-        for (int i = 0; i < totalVoiceCount && !anySounding; ++i)
-        {
-            anySounding = voices[i].isSounding();
-        }
         if (!anySounding)
         {
-            // With nothing sounding, just udpate the LFO phases
+            // with nothing sounding, just update the LFO phases
             globalLFO.update(true);
             vibratoLFO.update(true);
+
             if (oversample)
             {
                 globalLFO.update(true);
                 vibratoLFO.update(true);
             }
+
             *sm1 = 0.f;
             *sm2 = 0.f;
+
             return;
         }
 
@@ -666,6 +778,16 @@ class Motherboard
 
         *sm1 = vl * volume;
         *sm2 = vr * volume;
+
+        // check if we're still sounding
+        bool stillSounding = false;
+
+        for (int i = 0; i < totalVoiceCount && !stillSounding; ++i)
+        {
+            stillSounding = voices[i].isSounding();
+        }
+
+        anySounding = stillSounding;
     }
 };
 

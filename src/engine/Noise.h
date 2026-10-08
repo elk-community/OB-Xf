@@ -1,16 +1,12 @@
 /*
- * OB-Xf - a continuation of the last open source version of OB-Xd.
- *
  * OB-Xd was originally written by Vadim Filatov, and then a version
  * was released under the GPL3 at https://github.com/reales/OB-Xd.
  * Subsequently, the product was continued by DiscoDSP and the copyright
- * holders as an excellent closed source product. For more info,
- * see "HISTORY.md" in the root of this repository.
+ * holders as an excellent closed source product.
  *
- * This repository is a successor to the last open source release,
- * a version marked as 2.11. Copyright 2013-2025 by the authors
- * as indicated in the original release, and subsequent authors
- * per the GitHub transaction log.
+ * This repository is a successor to OB-Xd version 2.11.
+ * Copyright 2013-2025 by the authors as indicated in the original release,
+ * and subsequent authors as per GitHub transaction log.
  *
  * OB-Xf is released under the GNU General Public Licence v3 or later
  * (GPL-3.0-or-later). The license is found in the file "LICENSE"
@@ -24,8 +20,9 @@
 #define OBXF_SRC_ENGINE_NOISE_H
 
 #include <array>
-#include <math.h>
+#include <bit>
 #include <cstdint>
+#include <math.h>
 
 class Noise
 {
@@ -62,25 +59,16 @@ class Noise
         // if index is zero, don't update any random values
         if (pink.index != 0)
         {
-            int numZeros = 0;
-            int n = pink.index;
-
-            // determine how many trailing zeroes there are in index
-            // this algorithm will hang if n == 0, so test that first
-            while ((n & 1) == 0)
-            {
-                n = n >> 1;
-                numZeros++;
-            }
-
+            // count trailing zeros to determine which row to update
+            const int row = std::countr_zero(static_cast<uint32_t>(pink.index));
             const int32_t randomValue = getRandomValue() >> randomShift;
 
             // replace the indexed row's random value
             // subtract and add back to running sum instead of adding all the random values together
             // only one changes each time
-            pink.runningSum -= pink.rows[numZeros];
+            pink.runningSum -= pink.rows[row];
             pink.runningSum += randomValue;
-            pink.rows[numZeros] = randomValue;
+            pink.rows[row] = randomValue;
         }
 
         // add extra white noise value

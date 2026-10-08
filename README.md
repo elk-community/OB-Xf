@@ -12,8 +12,10 @@ We provide installers (signed DMG for macOS, EXE for Windows x64/ARM64/ARM64EC, 
 
 # Compatibility with OB-Xd
 
-Patches and banks created by OB-Xd are **NOT (!)** compatible with OB-Xf, due to a number of changes we decided to do for certain parameters.
-Patch conversion is likely possible for the most part, but is not the immediate priority, and 100% fidelity to OB-Xd cannot be guaranteed.
+Patches and banks created by OB-Xd **are** compatible with OB-Xf, using the "Import OB-Xd Bank..." option in the patch browser, or by simply drag-and-dropping OB-Xd FXP/FXB files onto OB-Xf's interface.
+This functionality was introduced in v1.1 update.
+
+Fidelity of conversion is retained in all cases except one. This is due to the fact that OB-Xd has an offset of 12 semitones when all coarse tuning controls are set to 0 semitones - so middle C produces ~464 Hz instead of the expected ~232 Hz. OB-Xf has fixed this reference pitch, and compensates for the discrepancy by increasing the Transpose parameter by 12 semitones. If Transpose parameter was already at maximum, both oscillators are pitched up by 12 semitones. If either of the oscillator pitch controls don't allow for an increase of 12 semitones, the imported patch will sound one octave lower than in OB-Xd.
 
 # Building
 
@@ -34,6 +36,29 @@ cmake --install Builds/Release
 ```
 
 You may need a sudo. Like the build, this will use the `CMAKE_INSTALL_PREFIX` for the shared location
+
+## iPad / iOS target (work in progress)
+
+iOS support is being added incrementally. The initial CMake wiring enables iOS-safe formats (`AUv3`, `Standalone`) and disables desktop-only packaging steps.
+
+OB-Xf is GPLv3 software. We do not distribute an iOS build through Apple's App Store because Apple and the FSF disagree on whether App Store distribution is compatible with GPLv3 terms. As a result, iOS support is self-build only.
+
+The current iOS CMake setup targets iPad (`TARGETED_DEVICE_FAMILY=2`).
+
+A starting point for generating an Xcode iOS project is:
+
+```bash
+cmake -B Builds/iOS -G Xcode -DCMAKE_SYSTEM_NAME=iOS -DOBXF_IOS_DISABLE_CODESIGN=ON .
+cmake --build Builds/iOS --config Release
+```
+
+If you want to sign for device install, set your team ID and disable the no-signing default:
+
+```bash
+cmake -B Builds/iOS -G Xcode -DCMAKE_SYSTEM_NAME=iOS -DOBXF_IOS_DISABLE_CODESIGN=OFF -DOBXF_IOS_DEVELOPMENT_TEAM=YOURTEAMID .
+```
+
+Packaging and asset installation for iOS are not complete yet.
 # Copyright
 
 This repository and the source code is under GPL3 license. OB-Xf is and always will be free in all contexts and for all uses, with the source code available and modifiable, and the software usable in any context, free or commercial.

@@ -1,16 +1,12 @@
 /*
- * OB-Xf - a continuation of the last open source version of OB-Xd.
- *
  * OB-Xd was originally written by Vadim Filatov, and then a version
  * was released under the GPL3 at https://github.com/reales/OB-Xd.
  * Subsequently, the product was continued by DiscoDSP and the copyright
- * holders as an excellent closed source product. For more info,
- * see "HISTORY.md" in the root of this repository.
+ * holders as an excellent closed source product.
  *
- * This repository is a successor to the last open source release,
- * a version marked as 2.11. Copyright 2013-2025 by the authors
- * as indicated in the original release, and subsequent authors
- * per the GitHub transaction log.
+ * This repository is a successor to OB-Xd version 2.11.
+ * Copyright 2013-2025 by the authors as indicated in the original release,
+ * and subsequent authors as per GitHub transaction log.
  *
  * OB-Xf is released under the GNU General Public Licence v3 or later
  * (GPL-3.0-or-later). The license is found in the file "LICENSE"
@@ -131,7 +127,14 @@ class ToggleButton final : public juce::ImageButton,
     {
         if (event.mods.isRightButtonDown())
         {
-            showPopupMenu();
+            if (rightClickCallback)
+            {
+                rightClickCallback();
+            }
+            else
+            {
+                showPopupMenu();
+            }
         }
         else
         {
@@ -168,34 +171,61 @@ class ToggleButton final : public juce::ImageButton,
 
         juce::PopupMenu menu;
 
-        if (auto name = getTitle(); std::isdigit(name.getLastCharacter()))
+        if (parameter)
         {
-            auto *obxf = dynamic_cast<ObxfAudioProcessor *>(owner);
+            menu.addSectionHeader(parameter->getName(128));
 
-            if (obxf)
+            menu.addSeparator();
+
+            auto editor = owner->getActiveEditor();
+
+            if (editor && obxf::useHostContextMenus(editor))
             {
-                menu.addSectionHeader("Patch Options");
+                if (auto *c = editor->getHostContext())
+                {
+                    if (auto menuInfo = c->getContextMenuForParameter(parameter))
+                    {
+                        auto hostMenu = menuInfo->getEquivalentPopupMenu();
+                        auto lf = obxf::obxfLookAndFeel(editor);
 
-                menu.addSeparator();
+                        if (lf)
+                        {
+                            hostMenu = lf->modifyHostMenu(hostMenu);
+                        }
 
-                menu.addItem(toOSCase(fmt::format("Copy Patch")),
-                             [obxf]() { obxf->utils->copyPatch(); });
+                        // merge host menu with our usual context menu
+                        if (hostMenu.getNumItems() > 0)
+                        {
+                            menu.addSeparator();
 
-                bool enabled = obxf->utils->isPatchInClipboard();
+                            juce::PopupMenu::MenuItemIterator it(hostMenu);
 
-                menu.addItem(toOSCase(fmt::format("Paste Patch")), enabled, false,
-                             [obxf]() { obxf->utils->pastePatch(); });
+                            while (it.next())
+                            {
+                                menu.addItem(it.getItem());
+                            }
+                        }
+                    }
+                }
             }
+        }
+        else
+        {
+            menu.addSectionHeader(getTitle());
         }
 
         menu.showMenuAsync(obxf::defaultPopupMenuOptions(this));
     }
+
+    void onRightClick(std::function<void()> cb) { rightClickCallback = std::move(cb); }
 
   private:
     juce::Image kni;
     int width, height, numFr, w2, h2;
     juce::AudioProcessor *owner{nullptr};
     juce::AudioProcessorParameterWithID *parameter{nullptr};
+
+    std::function<void()> rightClickCallback{nullptr};
 };
 
 #endif // OBXF_SRC_GUI_TOGGLEBUTTON_H

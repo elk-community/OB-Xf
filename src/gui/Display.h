@@ -1,16 +1,12 @@
 /*
- * OB-Xf - a continuation of the last open source version of OB-Xd.
- *
  * OB-Xd was originally written by Vadim Filatov, and then a version
  * was released under the GPL3 at https://github.com/reales/OB-Xd.
  * Subsequently, the product was continued by DiscoDSP and the copyright
- * holders as an excellent closed source product. For more info,
- * see "HISTORY.md" in the root of this repository.
+ * holders as an excellent closed source product.
  *
- * This repository is a successor to the last open source release,
- * a version marked as 2.11. Copyright 2013-2025 by the authors
- * as indicated in the original release, and subsequent authors
- * per the GitHub transaction log.
+ * This repository is a successor to OB-Xd version 2.11.
+ * Copyright 2013-2025 by the authors as indicated in the original release,
+ * and subsequent authors as per GitHub transaction log.
  *
  * OB-Xf is released under the GNU General Public Licence v3 or later
  * (GPL-3.0-or-later). The license is found in the file "LICENSE"
@@ -24,9 +20,61 @@
 #define OBXF_SRC_GUI_DISPLAY_H
 
 #include <functional>
+#include <configuration.h>
 #include <juce_gui_basics/juce_gui_basics.h>
 
-class Display final : public juce::Label
+struct TextBubble : public juce::BubbleComponent
+{
+    juce::TextLayout layout;
+
+    static constexpr int padding = 8;
+
+    TextBubble(const juce::StringArray &lines, const juce::Font &titleFont,
+               const juce::Font &rowFont, float parentWidth)
+    {
+        static constexpr float lineSpacing = 1.15f;
+
+        juce::AttributedString as;
+        as.setWordWrap(juce::AttributedString::byWord);
+        as.setJustification(juce::Justification::left);
+        as.setLineSpacing(rowFont.getHeight() * (lineSpacing - 1.f));
+
+        auto maxWidth = parentWidth * 1.5f;
+
+        for (int i = 0; i < lines.size(); ++i)
+        {
+            const auto &font = (i == 0) ? titleFont : rowFont;
+
+            as.append(lines[i], font, juce::Colours::white);
+
+            if (i + 1 < lines.size())
+            {
+                as.append("\n", font, juce::Colours::white);
+
+                maxWidth = std::max(maxWidth,
+                                    juce::GlyphArrangement::getStringWidth(rowFont, lines[i + 1]) +
+                                        padding);
+            }
+        }
+
+        layout.createLayout(as, maxWidth);
+    }
+
+    void getContentSize(int &w, int &h) override
+    {
+        w = static_cast<int>(std::ceil(layout.getWidth())) + padding;
+        h = static_cast<int>(std::ceil(layout.getHeight())) + padding;
+    }
+
+    void paintContent(juce::Graphics &g, int w, int h) override
+    {
+        g.setColour(findColour(juce::TooltipWindow::textColourId));
+        layout.draw(
+            g, juce::Rectangle<float>(padding * 0.5f, padding * 0.5f, w - padding, h - padding));
+    }
+};
+
+class Display final : public juce::Label, private juce::Timer
 {
   public:
     Display(const juce::String &name, std::function<float()> gs)
@@ -38,8 +86,56 @@ class Display final : public juce::Label
         setEditable(true);
     }
 
+    ~Display() override { dismissBubble(); }
+
+    std::function<juce::StringArray()> getExtraRows{nullptr};
+
+    int bubbleDelay{0};
+
+    std::function<void()> onPopupMenu{nullptr};
+
+    void mouseEnter(const juce::MouseEvent &) override
+    {
+        if (isTextClipped || !extraRows().isEmpty())
+        {
+            if (bubbleDelay > 0)
+            {
+                startTimer(bubbleDelay);
+            }
+            else
+            {
+                showBubble();
+            }
+        }
+    }
+
+    void mouseDown(const juce::MouseEvent &event) override
+    {
+        if (event.mods.isPopupMenu() && onPopupMenu)
+        {
+            // otherwise the bubble hovers over the menu we're about to open
+            dismissBubble();
+            onPopupMenu();
+
+            return;
+        }
+
+        juce::Label::mouseDown(event);
+    }
+
+    void mouseExit(const juce::MouseEvent &) override { dismissBubble(); }
+
+    void setText(const juce::String &newText, juce::NotificationType notification)
+    {
+        dismissBubble();
+        juce::Label::setText(newText, notification);
+    }
+
     void editorShown(juce::TextEditor *editor) override
     {
+        // a pending bubble would otherwise pop up over the editor
+        dismissBubble();
+
         // sigh, JUCE, you could've fixed this for the label's editor in the past 10 years...
         editor->setJustification(getJustificationType());
         // and let's not get me started on inconsistent indents...
@@ -53,7 +149,9 @@ class Display final : public juce::Label
     void paint(juce::Graphics &g) override
     {
         if (isBeingEdited())
+        {
             return;
+        }
 
         auto sf = getScale();
 
@@ -65,6 +163,8 @@ class Display final : public juce::Label
         auto textArea = getLocalBounds().transformedBy(juce::AffineTransform().scaled(1.0 / sf));
         auto w = juce::GlyphArrangement::getStringWidth(font, getText());
         auto r = std::min(1.f * (textArea.getWidth() - 4) / w, 1.5f);
+
+        isTextClipped = false;
 
         if (r >= 0.9f)
         {
@@ -92,13 +192,82 @@ class Display final : public juce::Label
             g.reduceClipRegion(textArea.reduced(2));
             g.setColour(findColour(Label::textColourId));
             g.setFont(font);
-            g.drawMultiLineText(getText(), 2, font.getHeight() - font.getDescent() + 2,
+
+            juce::GlyphArrangement ga;
+
+            ga.addJustifiedText(font, getText(), textArea.getX() + 2,
+                                textArea.getY() + font.getHeight() - font.getDescent() + 2,
                                 textArea.getWidth() - 4, juce::Justification::centred, -3.f);
+            ga.draw(g);
+
+            isTextClipped = ga.getBoundingBox(0, -1, true).getBottom() > textArea.getBottom();
         }
     }
 
   private:
     std::function<float()> getScale = []() { return 1.0; };
+    bool isTextClipped{false};
+
+    juce::Component::SafePointer<TextBubble> bubble;
+
+    juce::StringArray extraRows() const
+    {
+        return getExtraRows ? getExtraRows() : juce::StringArray{};
+    }
+
+    void showBubble()
+    {
+        dismissBubble();
+
+        auto *topLevel = getTopLevelComponent();
+
+        if (!topLevel)
+        {
+            return;
+        }
+
+        const auto lf = obxf::obxfLookAndFeel(this);
+        const auto sf = lf ? lf->editorScaleFactor() : 1.0f;
+        const auto font = withDefaultMetrics(juce::FontOptions(15.0f, juce::Font::bold));
+        const auto rowFont = withDefaultMetrics(juce::FontOptions(15.0f, juce::Font::plain));
+        auto fh = font.getHeight() * 0.75f;
+
+        juce::StringArray lines;
+
+        lines.add(getText());
+        lines.addArray(extraRows());
+
+        auto *b = new TextBubble(lines, font.withHeight(fh * sf), rowFont.withHeight(fh * sf),
+                                 static_cast<float>(getWidth()));
+        bubble = b;
+
+        topLevel->addAndMakeVisible(b);
+
+        b->setAllowedPlacement(juce::BubbleComponent::above);
+        b->setPosition(topLevel->getLocalArea(nullptr, getScreenBounds()));
+    }
+
+    void timerCallback() override
+    {
+        stopTimer();
+        showBubble();
+    }
+
+    void dismissBubble()
+    {
+        stopTimer();
+
+        if (bubble != nullptr)
+        {
+            bubble->setVisible(false);
+
+            // Safe even if already deleted; SafePointer will be null.
+            delete bubble.getComponent();
+
+            bubble = nullptr;
+        }
+    }
+
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(Display)
 };
 

@@ -1,16 +1,12 @@
 /*
- * OB-Xf - a continuation of the last open source version of OB-Xd.
- *
  * OB-Xd was originally written by Vadim Filatov, and then a version
  * was released under the GPL3 at https://github.com/reales/OB-Xd.
  * Subsequently, the product was continued by DiscoDSP and the copyright
- * holders as an excellent closed source product. For more info,
- * see "HISTORY.md" in the root of this repository.
+ * holders as an excellent closed source product.
  *
- * This repository is a successor to the last open source release,
- * a version marked as 2.11. Copyright 2013-2025 by the authors
- * as indicated in the original release, and subsequent authors
- * per the GitHub transaction log.
+ * This repository is a successor to OB-Xd version 2.11.
+ * Copyright 2013-2025 by the authors as indicated in the original release,
+ * and subsequent authors as per GitHub transaction log.
  *
  * OB-Xf is released under the GNU General Public Licence v3 or later
  * (GPL-3.0-or-later). The license is found in the file "LICENSE"
@@ -21,7 +17,8 @@
  */
 
 #include "StateManager.h"
-#include "PluginProcessor.h"
+#include "ObxdImporter.h"
+#include "ObxfProcessor.h"
 
 template <typename T> juce::String S(const T &text) { return juce::String(text); }
 
@@ -75,10 +72,117 @@ void StateManager::getActiveProgramStateOnto(juce::XmlElement &xmlState) const
 
     xmlState.setAttribute(S("voiceCount"), MAX_VOICES);
     xmlState.setAttribute(S("programName"), prog.getName());
+
+    auto vmEl = audioProcessor->getSynth().getMotherboard()->voiceMatrix.toElement();
+    xmlState.addChildElement(vmEl.release());
     xmlState.setAttribute(S("author"), prog.getAuthor());
     xmlState.setAttribute(S("license"), prog.getLicense());
     xmlState.setAttribute(S("category"), prog.getCategory());
     xmlState.setAttribute(S("project"), prog.getProject());
+}
+
+bool StateManager::getChunkFromFxpData(const void *data, size_t dataSize, const void *&outChunkData,
+                                       int &outChunkSize)
+{
+    if (dataSize < static_cast<int>(sizeof(fxProgramSet)))
+    {
+        return false;
+    }
+
+    const auto set = static_cast<const fxProgramSet *>(data);
+    const int32_t chunkSize = fxbSwap(set->chunkSize);
+
+    if (chunkSize < 0)
+    {
+        return false;
+    }
+
+    if ((!compareMagic(set->chunkMagic, "CcnK")) || fxbSwap(set->version) > fxbVersionNum)
+    {
+        return false;
+    }
+
+    if (compareMagic(set->fxMagic, "FPCh"))
+    {
+        const size_t chunkSize = static_cast<size_t>(fxbSwap(set->chunkSize));
+
+        if (chunkSize + sizeof(fxProgramSet) - 8 > dataSize)
+        {
+            return false;
+        }
+
+        outChunkData = set->chunk;
+        outChunkSize = static_cast<int>(chunkSize);
+
+        return true;
+    }
+    else
+    {
+        OBLOG(state, "Support for format " << set->fxMagic << " not available");
+        return false;
+    }
+}
+
+void StateManager::populateProgramFromXml(Program &program, const juce::XmlElement &e,
+                                          uint64_t versionNumber)
+{
+    program.setToDefaultPatch();
+
+    const bool newFormat = e.hasAttribute("voiceCount");
+
+    for (auto *param : ObxfAudioProcessor::ObxfParams(*audioProcessor))
+    {
+        const auto &paramId = param->paramID;
+        float value = 0.0f;
+
+        if (e.hasAttribute(paramId))
+        {
+            value = static_cast<float>(e.getDoubleAttribute(paramId, program.values[paramId]));
+        }
+        else
+        {
+            value = program.values[paramId];
+        }
+
+        if (!newFormat && paramId == "POLYPHONY")
+        {
+            value *= 0.25f;
+        }
+
+        // Legacy version mapping
+        if (versionNumber < 0x2025'12'13)
+        {
+            if (paramId.compare(SynthParam::ID::UnisonVoices) == 0)
+            {
+                const auto oldVal = juce::jlimit(
+                    0, MAX_PANNINGS - 1, static_cast<int>(std::round(value * (MAX_PANNINGS - 1))));
+                value = static_cast<float>(oldVal) / static_cast<float>(MAX_VOICES - 1);
+            }
+        }
+
+        program.values[paramId] = value;
+    }
+
+    // handle parameter locks
+    if (audioProcessor->lockHighQuality)
+    {
+        program.values[ID::HQMode] = static_cast<float>(audioProcessor->lockedHQ);
+    }
+
+    if (audioProcessor->lockPitchBend)
+    {
+        program.values[ID::BendDownRange] = static_cast<float>(audioProcessor->lockedPBDownRange) /
+                                            static_cast<float>(MAX_BEND_RANGE);
+        program.values[ID::BendUpRange] = static_cast<float>(audioProcessor->lockedPBUpRange) /
+                                          static_cast<float>(MAX_BEND_RANGE);
+    }
+
+    // Populate Metadata
+    program.setName(e.getStringAttribute("programName", "Init"));
+    program.setAuthor(e.getStringAttribute("author", ""));
+    program.setLicense(e.getStringAttribute("license", ""));
+    program.setCategory(e.getStringAttribute("category", ""));
+    program.setProject(e.getStringAttribute("project", ""));
 }
 
 void StateManager::setPluginStateInformation(const void *data, int sizeInBytes)
@@ -94,6 +198,7 @@ void StateManager::setPluginStateInformation(const void *data, int sizeInBytes)
         OBLOG(state, "Streaming version: " << ver << " (" << verNo << ")");
 
         auto pnode = xmlState->getChildByName("program");
+
         if (!pnode)
         {
             OBLOG(state, "No program element found!");
@@ -104,7 +209,12 @@ void StateManager::setPluginStateInformation(const void *data, int sizeInBytes)
 
         if (auto desp = xmlState->getChildByName(S("dawExtraState")))
         {
-            dawExtraState.fromElement(desp->getFirstChildElement());
+            auto el = desp->getFirstChildElement();
+
+            if (el)
+            {
+                dawExtraState.fromElement(el);
+            }
         }
 
         audioProcessor->processActiveProgramChanged();
@@ -129,86 +239,112 @@ void StateManager::setProgramStateInformation(const void *data, const int sizeIn
 void StateManager::setActiveProgramStateFrom(const juce::XmlElement &pnode, uint64_t versionNumber)
 {
     auto &program = audioProcessor->getActiveProgram();
-    program.setToDefaultPatch();
 
-    const bool newFormat = pnode.hasAttribute("voiceCount");
+    populateProgramFromXml(program, pnode, versionNumber);
 
-    for (auto *param : ObxfAudioProcessor::ObxfParams(*audioProcessor))
-    {
-        const auto &paramId = param->paramID;
-        float value = 0.0f;
+    auto *mb = audioProcessor->getSynth().getMotherboard();
 
-        if (pnode.hasAttribute(paramId))
-            value = static_cast<float>(pnode.getDoubleAttribute(paramId, program.values[paramId]));
-        else
-            value = program.values[paramId];
-
-        if (!newFormat && paramId == "POLYPHONY")
-        {
-            value *= 0.25f;
-        }
-
-        // pre-1.0: Increased Unison Voices from 8 to 32
-        if (versionNumber < 0x2025'12'13)
-        {
-            if (paramId.compare(SynthParam::ID::UnisonVoices) == 0)
-            {
-                const auto oldVal = juce::jlimit(
-                    0, MAX_PANNINGS - 1, static_cast<int>(std::round(value * (MAX_PANNINGS - 1))));
-                value = static_cast<float>(oldVal) / static_cast<float>(MAX_VOICES - 1);
-            }
-        }
-
-        program.values[paramId] = value;
-    }
-
-    program.setName(pnode.getStringAttribute(S("programName"), S(INIT_PATCH_NAME)));
-    program.setAuthor(pnode.getStringAttribute(S("author"), S("")));
-    program.setLicense(pnode.getStringAttribute(S("license"), S("")));
-    program.setCategory(pnode.getStringAttribute(S("category"), S("")));
-    program.setProject(pnode.getStringAttribute(S("project"), S("")));
+    mb->voiceMatrix.fromElement(pnode.getChildByName("VoiceMatrix"));
+    mb->recalculateAllMatrices();
 }
 
 bool StateManager::loadFromMemoryBlock(juce::MemoryBlock &mb)
 {
-    const void *const data = mb.getData();
-    const size_t dataSize = mb.getSize();
-
-    if (dataSize < 28)
-        return false;
-
-    const auto set = static_cast<const fxSet *>(data);
-
-    if ((!compareMagic(set->chunkMagic, "CcnK")) || fxbSwap(set->version) > fxbVersionNum)
-        return false;
-
-    if (compareMagic(set->fxMagic, "FPCh")) // patch memory chunk
+    if (ObxdImporter::isOBXdData(mb.getData(), mb.getSize()))
     {
-        const auto *const cset = static_cast<const fxProgramSet *>(data);
-
-        if (static_cast<size_t>(fxbSwap(cset->chunkSize)) + sizeof(fxProgramSet) - 8 >
-            static_cast<size_t>(dataSize))
+        auto &program = audioProcessor->getActiveProgram();
+        std::vector<std::string> warnings;
+        if (!ObxdImporter::importSingleOnto(mb.getData(), mb.getSize(), program, &warnings))
+        {
+            OBLOG(state, "OB-Xd import failed");
             return false;
-        setProgramStateInformation(cset->chunk, fxbSwap(cset->chunkSize));
+        }
+
+        for (const auto &w : warnings)
+        {
+            OBLOG(state, "OB-Xd import: " << w);
+        }
+
+        auto *mb = audioProcessor->getSynth().getMotherboard();
+
+        mb->voiceMatrix.fromElement(nullptr);
+        mb->recalculateAllMatrices();
+        audioProcessor->processActiveProgramChanged();
+        audioProcessor->sendChangeMessage();
+        return true;
     }
-    else
+
+    const void *data = nullptr;
+    int sizeInBytes = 0;
+
+    if (!getChunkFromFxpData(mb.getData(), mb.getSize(), data, sizeInBytes))
     {
-        OBLOG(state, "Support for format " << set->fxMagic << " not available");
         return false;
     }
+
+    setProgramStateInformation(data, sizeInBytes);
 
     return true;
+}
+
+bool StateManager::loadFromMemoryBlockOntoProgram(juce::MemoryBlock &mb, Program &program)
+{
+    if (ObxdImporter::isOBXdData(mb.getData(), mb.getSize()))
+    {
+        return ObxdImporter::importSingleOnto(mb.getData(), mb.getSize(), program);
+    }
+
+    const void *data = nullptr;
+    int sizeInBytes = 0;
+
+    if (!getChunkFromFxpData(mb.getData(), mb.getSize(), data, sizeInBytes))
+    {
+        return false;
+    }
+
+    if (const std::unique_ptr<juce::XmlElement> e =
+            juce::AudioProcessor::getXmlFromBinary(data, sizeInBytes))
+    {
+        auto ver = e->getStringAttribute("ob-xf_version");
+        auto verNo = fromHumanReadableVersion(ver.toStdString());
+
+        populateProgramFromXml(program, *e, verNo);
+
+        return true;
+    }
+
+    return false;
 }
 
 void StateManager::collectDAWExtraStateFromInstance()
 {
     static_assert(NUM_MIDI_CC == 128);
 
-    auto &mmap = audioProcessor->getMidiHandler().getMidiMap();
+    auto &mh = audioProcessor->getMidiHandler();
+    auto &mmap = mh.getMidiMap();
 
     dawExtraState.controllers = mmap.controllers;
+
     dawExtraState.selectedLFOIndex = audioProcessor->selectedLFOIndex;
+    dawExtraState.selectedMPEDimension = audioProcessor->selectedMPEDimension;
+    dawExtraState.selectedMPEPanel = audioProcessor->selectedMPEPanel;
+    dawExtraState.selectedMTSESPPanel = audioProcessor->selectedMTSESPPanel;
+
     dawExtraState.impliedScaleFactor = audioProcessor->lastImpliedScaleFactor;
+
+    dawExtraState.mpeEnabled = mh.mpeEnabled.load();
+    dawExtraState.mpePitchBendRange = mh.mpePitchBendRange.load();
+
+    dawExtraState.mutateSections = audioProcessor->mutateSections;
+
+    dawExtraState.dynamicMTSESP = audioProcessor->dynamicMTSESP.load();
+
+    dawExtraState.lockPitchBend = audioProcessor->lockPitchBend.load();
+    dawExtraState.pitchBendDownRange = audioProcessor->lockedPBDownRange;
+    dawExtraState.pitchBendUpRange = audioProcessor->lockedPBUpRange;
+
+    dawExtraState.lockHQ = audioProcessor->lockHighQuality.load();
+    dawExtraState.highQuality = audioProcessor->lockedHQ;
 }
 
 void StateManager::applyDAWExtraStateToInstance()
@@ -221,7 +357,25 @@ void StateManager::applyDAWExtraStateToInstance()
     mmap.resyncParamIDCache();
 
     audioProcessor->selectedLFOIndex = dawExtraState.selectedLFOIndex;
+    audioProcessor->selectedMPEDimension = dawExtraState.selectedMPEDimension;
+    audioProcessor->selectedMPEPanel = dawExtraState.selectedMPEPanel;
+    audioProcessor->selectedMTSESPPanel = dawExtraState.selectedMTSESPPanel;
+
     audioProcessor->lastImpliedScaleFactor = dawExtraState.impliedScaleFactor;
+
+    audioProcessor->setMpeEnabled(dawExtraState.mpeEnabled);
+    audioProcessor->setMpePitchBendRange(dawExtraState.mpePitchBendRange);
+
+    audioProcessor->mutateSections = dawExtraState.mutateSections;
+
+    audioProcessor->dynamicMTSESP.store(dawExtraState.dynamicMTSESP);
+
+    audioProcessor->lockPitchBend.store(dawExtraState.lockPitchBend);
+    audioProcessor->lockedPBDownRange = dawExtraState.pitchBendDownRange;
+    audioProcessor->lockedPBUpRange = dawExtraState.pitchBendUpRange;
+
+    audioProcessor->lockHighQuality.store(dawExtraState.lockHQ);
+    audioProcessor->lockedHQ = dawExtraState.highQuality;
 }
 
 void StateManager::DAWExtraState::fromElement(const juce::XmlElement *e)
@@ -239,7 +393,25 @@ void StateManager::DAWExtraState::fromElement(const juce::XmlElement *e)
     }
 
     selectedLFOIndex = e->getIntAttribute("selectedLFOIndex", 0);
+    selectedMPEDimension = e->getIntAttribute("selectedMPEDimension", 0);
+    selectedMPEPanel = e->getBoolAttribute("selectedMPEPanel", false);
+    selectedMTSESPPanel = e->getBoolAttribute("selectedMTSESPPanel", false);
+
     impliedScaleFactor = e->getDoubleAttribute("impliedScaleFactor", 1.0);
+
+    mpeEnabled = e->getBoolAttribute("mpeEnabled", false);
+    mpePitchBendRange = e->getIntAttribute("mpePitchBendRange", 48);
+
+    mutateSections = e->getIntAttribute("mutateSections", 0);
+
+    lockHQ = e->getBoolAttribute("lockHQ", false);
+    highQuality = e->getBoolAttribute("lockedHighQuality", false);
+
+    dynamicMTSESP = e->getBoolAttribute("dynamicMTSESP", false);
+
+    lockPitchBend = e->getBoolAttribute("lockPitchBend", false);
+    pitchBendDownRange = e->getIntAttribute("lockedPitchBendDownRange", 2);
+    pitchBendUpRange = e->getIntAttribute("lockedPitchBendUpRange", 2);
 }
 
 std::unique_ptr<juce::XmlElement> StateManager::DAWExtraState::toElement() const
@@ -257,6 +429,28 @@ std::unique_ptr<juce::XmlElement> StateManager::DAWExtraState::toElement() const
     }
 
     res->setAttribute("selectedLFOIndex", selectedLFOIndex);
+    res->setAttribute("selectedMPEDimension", selectedMPEDimension);
+    res->setAttribute("selectedMPEPanel", selectedMPEPanel);
+    res->setAttribute("selectedMTSESPPanel", selectedMTSESPPanel);
+
     res->setAttribute("impliedScaleFactor", impliedScaleFactor);
+
+    res->setAttribute("mpeEnabled", mpeEnabled);
+    res->setAttribute("mpePitchBendRange", mpePitchBendRange);
+
+    static_assert(NUM_SECTIONS_TO_MUTATE < 32,
+                  "This synth is not supposed to have this many parameter sections at all!");
+
+    res->setAttribute("mutateSections", static_cast<int>(mutateSections.to_ulong()));
+
+    res->setAttribute("lockHQ", lockHQ);
+    res->setAttribute("lockedHighQuality", highQuality);
+
+    res->setAttribute("dynamicMTSESP", dynamicMTSESP);
+
+    res->setAttribute("lockPitchBend", lockPitchBend);
+    res->setAttribute("lockedPitchBendDownRange", pitchBendDownRange);
+    res->setAttribute("lockedPitchBendUpRange", pitchBendUpRange);
+
     return res;
 }

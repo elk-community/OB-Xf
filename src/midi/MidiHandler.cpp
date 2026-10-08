@@ -1,16 +1,12 @@
 /*
- * OB-Xf - a continuation of the last open source version of OB-Xd.
- *
  * OB-Xd was originally written by Vadim Filatov, and then a version
  * was released under the GPL3 at https://github.com/reales/OB-Xd.
  * Subsequently, the product was continued by DiscoDSP and the copyright
- * holders as an excellent closed source product. For more info,
- * see "HISTORY.md" in the root of this repository.
+ * holders as an excellent closed source product.
  *
- * This repository is a successor to the last open source release,
- * a version marked as 2.11. Copyright 2013-2025 by the authors
- * as indicated in the original release, and subsequent authors
- * per the GitHub transaction log.
+ * This repository is a successor to OB-Xd version 2.11.
+ * Copyright 2013-2025 by the authors as indicated in the original release,
+ * and subsequent authors as per GitHub transaction log.
  *
  * OB-Xf is released under the GNU General Public Licence v3 or later
  * (GPL-3.0-or-later). The license is found in the file "LICENSE"
@@ -21,6 +17,7 @@
  */
 
 #include <MidiHandler.h>
+#include <ObxfProcessor.h>
 #include <Utils.h>
 #include <engine/SynthEngine.h>
 #include "MidiMap.h"
@@ -60,8 +57,9 @@ struct MidiHandler::LagHandler
     }
 };
 
-MidiHandler::MidiHandler(SynthEngine &s, MidiMap &b, ParameterCoordinator &pm)
-    : synth(s), bindings(b), paramCoordinator(pm)
+MidiHandler::MidiHandler(SynthEngine &s, MidiMap &b, ParameterCoordinator &pm,
+                         ObxfAudioProcessor &proc)
+    : synth(s), bindings(b), paramCoordinator(pm), processor(proc)
 {
     lagHandler = std::make_unique<LagHandler>(*this);
 }
@@ -110,7 +108,8 @@ void MidiHandler::processMidiPerSample(juce::MidiBufferIterator *iter,
             continue;
 
         const auto status = data[0] & 0xF0;
-        if (status != 0x80 && status != 0x90 && status != 0xB0 && status != 0xC0 && status != 0xE0)
+        if (status != 0x80 && status != 0x90 && status != 0xB0 && status != 0xC0 &&
+            status != 0xD0 && status != 0xE0)
             continue;
 
         // DBG("Valid Message: " << (int)midiMsg->getChannel() << " "
@@ -130,8 +129,30 @@ void MidiHandler::processMidiPerSample(juce::MidiBufferIterator *iter,
         }
         if (midiMsg->isPitchWheel())
         {
-            synth.processPitchWheel((midiMsg->getPitchWheelValue() - 8192) / 8192.0f);
+            const float pitchVal = (midiMsg->getPitchWheelValue() - 8192) / 8192.0f;
+            if (mpeEnabled.load() && midiMsg->getChannel() != 1)
+            {
+                synth.processMPEPitch(static_cast<int8_t>(midiMsg->getChannel() - 1), pitchVal);
+            }
+            else
+            {
+                synth.processPitchWheel(pitchVal);
+            }
         }
+        if (midiMsg->isChannelPressure())
+        {
+            if (mpeEnabled.load() && midiMsg->getChannel() != 1)
+            {
+                synth.processMPEChannelPressure(static_cast<int8_t>(midiMsg->getChannel() - 1),
+                                                midiMsg->getChannelPressureValue() / 127.0f);
+            }
+            else
+            {
+                synth.processMPEChannelPressure(static_cast<int8_t>(-1),
+                                                midiMsg->getChannelPressureValue() / 127.0f);
+            }
+        }
+
         if (midiMsg->isController())
         {
             bool dontLearn = false;
@@ -146,8 +167,43 @@ void MidiHandler::processMidiPerSample(juce::MidiBufferIterator *iter,
                 synth.processModWheel(midiMsg->getControllerValue() / 127.0f);
                 dontLearn = true;
                 break;
+            case 6: // Data Entry MSB
+                dataEntryMSB = static_cast<uint8_t>(midiMsg->getControllerValue());
+                handleRPN();
+                dontLearn = true;
+                break;
+            case 38: // Data Entry LSB
+                dataEntryLSB = static_cast<uint8_t>(midiMsg->getControllerValue());
+                dontLearn = true;
+                break;
             case 64:
+                dontLearn = true;
+                break;
             case 74:
+                if (mpeEnabled.load() && midiMsg->getChannel() != 1)
+                {
+                    synth.processMPETimbre(static_cast<int8_t>(midiMsg->getChannel() - 1),
+                                           midiMsg->getControllerValue() / 127.0f);
+                }
+                else
+                {
+                    synth.processMPETimbre(static_cast<int8_t>(-1),
+                                           midiMsg->getControllerValue() / 127.0f);
+                }
+                dontLearn = true;
+                break;
+            case 100: // RPN LSB
+                rpnLSB = static_cast<uint8_t>(midiMsg->getControllerValue());
+                dontLearn = true;
+                break;
+
+            case 101: // RPN MSB
+                rpnMSB = static_cast<uint8_t>(midiMsg->getControllerValue());
+                // reset data on new RPN select
+                dataEntryMSB = 0;
+                dataEntryLSB = 0;
+                dontLearn = true;
+                break;
             case 120:
             case 123:
                 dontLearn = true;
@@ -165,6 +221,12 @@ void MidiHandler::processMidiPerSample(juce::MidiBufferIterator *iter,
                     midiControlledParamSet = true;
 
                     bindings.updateCC(lastUsedParameter, lastMovedController);
+
+                    if (onMidiLearnBinding)
+                    {
+                        auto callback = onMidiLearnBinding;
+                        juce::MessageManager::callAsync(callback);
+                    }
                 }
 
                 if (bindings.isBound(lastMovedController))
@@ -174,8 +236,12 @@ void MidiHandler::processMidiPerSample(juce::MidiBufferIterator *iter,
                     lagHandler->setTarget(lastMovedController, val);
 
                     lastMovedController = 0;
-                    lastUsedParameter = 0;
-                    midiControlledParamSet = false;
+
+                    if (!paramCoordinator.midiLearnAttachment.get())
+                    {
+                        lastUsedParameter = 0;
+                        midiControlledParamSet = false;
+                    }
                 }
             }
         }
@@ -211,12 +277,59 @@ void MidiHandler::processMidiPerSample(juce::MidiBufferIterator *iter,
         }
     }
 }
+
+void MidiHandler::handleRPN()
+{
+    if (rpnMSB == 127 && rpnLSB == 127)
+    {
+        return;
+    }
+
+    // Pitch Bend Sensitivity
+    if (rpnMSB == 0 && rpnLSB == 0)
+    {
+        // MSB = semitones, LSB = cents (which we ignore here)
+        const int semitones = std::min(static_cast<int>(dataEntryMSB), MAX_MPE_BEND_RANGE);
+        const bool isMasterChannel = (midiMsg->getChannel() == 1);
+
+        juce::MessageManager::callAsync([this, semitones, isMasterChannel]() {
+            if (isMasterChannel)
+            {
+                processor.setGlobalPitchBendRange(semitones);
+            }
+            else
+            {
+                processor.setMpePitchBendRange(semitones);
+            }
+        });
+        return;
+    }
+
+    // MPE Configuration Message
+    if (rpnMSB == 0 && rpnLSB == 6)
+    {
+        // We only support lower MPE zone
+        if (midiMsg->getChannel() > 1)
+        {
+            return;
+        }
+
+        // dataEntryMSB = number of member channels; 0 = MPE disabled
+        const int memberChannels = static_cast<int>(dataEntryMSB);
+
+        juce::MessageManager::callAsync(
+            [this, memberChannels]() { processor.setMpeEnabled(memberChannels > 0); });
+        return;
+    }
+}
+
 void MidiHandler::processLags()
 {
     if (lagPos == 0)
     {
         lagHandler->processAll();
     }
+
     lagPos = (lagPos + 1) & (midiBlock - 1);
 }
 
@@ -224,7 +337,9 @@ bool MidiHandler::getNextEvent(juce::MidiBufferIterator *iter, const juce::MidiB
                                const int samplePos)
 {
     if (iter == nullptr || *iter == midiBuffer.end())
+    {
         return false;
+    }
 
     if (const auto metadata = **iter;
         metadata.samplePosition <= samplePos && metadata.getMessage().getRawDataSize() > 0)
@@ -234,6 +349,7 @@ bool MidiHandler::getNextEvent(juce::MidiBufferIterator *iter, const juce::MidiB
         ++(*iter);
         return true;
     }
+
     return false;
 }
 

@@ -1,16 +1,12 @@
 /*
- * OB-Xf - a continuation of the last open source version of OB-Xd.
- *
  * OB-Xd was originally written by Vadim Filatov, and then a version
  * was released under the GPL3 at https://github.com/reales/OB-Xd.
  * Subsequently, the product was continued by DiscoDSP and the copyright
- * holders as an excellent closed source product. For more info,
- * see "HISTORY.md" in the root of this repository.
+ * holders as an excellent closed source product.
  *
- * This repository is a successor to the last open source release,
- * a version marked as 2.11. Copyright 2013-2025 by the authors
- * as indicated in the original release, and subsequent authors
- * per the GitHub transaction log.
+ * This repository is a successor to OB-Xd version 2.11.
+ * Copyright 2013-2025 by the authors as indicated in the original release,
+ * and subsequent authors as per GitHub transaction log.
  *
  * OB-Xf is released under the GNU General Public Licence v3 or later
  * (GPL-3.0-or-later). The license is found in the file "LICENSE"
@@ -21,12 +17,14 @@
  */
 
 #include "LookAndFeel.h"
-#include "PluginEditor.h"
+#include "ObxfEditor.h"
 
 namespace obxf
 {
 juce::PopupMenu::Options LookAndFeel::defaultPopupMenuOptions()
 {
+    if (editor && editor->dontParentMenusToEditor)
+        return juce::PopupMenu::Options();
     return juce::PopupMenu::Options().withParentComponent(editor);
 }
 
@@ -40,8 +38,8 @@ juce::Font LookAndFeel::getPopupMenuFont()
 juce::Font LookAndFeel::getSliderPopupFont(juce::Slider &s)
 {
     auto f = LookAndFeel_V4::getSliderPopupFont(s);
-    auto fh = f.getHeight() * 1.1;
-    return f.withHeight(fh * editor->impliedScaleFactor() / editor->utils.getPluginAPIScale());
+    auto fh = f.getHeight() * 0.75f;
+    return f.withHeight(fh * editorScaleFactor());
 }
 
 void LookAndFeel::getIdealPopupMenuItemSizeWithOptions(const juce::String &text, bool isSeparator,
@@ -78,5 +76,66 @@ void LookAndFeel::getIdealPopupMenuSectionHeaderSizeWithOptions(const juce::Stri
 }
 
 float LookAndFeel::menuScaleFactor() const { return editor->menuScaleFactor(); }
+
+float LookAndFeel::editorScaleFactor() const
+{
+    return editor->impliedScaleFactor() / editor->utils.getPluginAPIScale();
+}
+
+bool useHostContextMenus(juce::AudioProcessorEditor *editor)
+{
+    const auto *e = dynamic_cast<ObxfAudioProcessorEditor *>(editor);
+
+    return e && e->useHostContextMenus();
+}
+
+juce::PopupMenu LookAndFeel::modifyHostMenu(juce::PopupMenu menu)
+{
+    // make things look a bit nicer for our friends from Image-Line
+    if (juce::PluginHostType().isFruityLoops())
+    {
+        auto it = juce::PopupMenu::MenuItemIterator(menu);
+
+        while (it.next())
+        {
+            auto txt = it.getItem().text;
+
+            if (txt.startsWithChar('-'))
+            {
+                it.getItem().isSectionHeader = true;
+                it.getItem().text = txt.fromFirstOccurrenceOf("-", false, false);
+            }
+        }
+
+        return menu;
+    }
+
+    // we really don't need that parameter name repeated in Reaper...
+    if (juce::PluginHostType().isReaper())
+    {
+        auto newMenu = juce::PopupMenu();
+        auto it = juce::PopupMenu::MenuItemIterator(menu);
+
+        while (it.next())
+        {
+            auto txt = it.getItem().text;
+            bool include = true;
+
+            if (txt.startsWithChar('[') && txt.endsWithChar(']'))
+            {
+                include = it.next();
+            }
+
+            if (include)
+            {
+                newMenu.addItem(it.getItem());
+            }
+        }
+
+        return newMenu;
+    }
+
+    return menu;
+}
 
 } // namespace obxf

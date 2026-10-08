@@ -1,16 +1,12 @@
 /*
- * OB-Xf - a continuation of the last open source version of OB-Xd.
- *
  * OB-Xd was originally written by Vadim Filatov, and then a version
  * was released under the GPL3 at https://github.com/reales/OB-Xd.
  * Subsequently, the product was continued by DiscoDSP and the copyright
- * holders as an excellent closed source product. For more info,
- * see "HISTORY.md" in the root of this repository.
+ * holders as an excellent closed source product.
  *
- * This repository is a successor to the last open source release,
- * a version marked as 2.11. Copyright 2013-2025 by the authors
- * as indicated in the original release, and subsequent authors
- * per the GitHub transaction log.
+ * This repository is a successor to OB-Xd version 2.11.
+ * Copyright 2013-2025 by the authors as indicated in the original release,
+ * and subsequent authors as per GitHub transaction log.
  *
  * OB-Xf is released under the GNU General Public Licence v3 or later
  * (GPL-3.0-or-later). The license is found in the file "LICENSE"
@@ -43,6 +39,12 @@ class StateManager final
     StateManager &operator=(const StateManager &) = delete;
 
     bool loadFromMemoryBlock(juce::MemoryBlock &mb);
+    bool loadFromMemoryBlockOntoProgram(juce::MemoryBlock &mb, Program &program);
+
+    bool getChunkFromFxpData(const void *data, size_t dataSize, const void *&outChunkData,
+                             int &outChunkSize);
+    void populateProgramFromXml(Program &program, const juce::XmlElement &e,
+                                uint64_t versionNumber);
 
     // This is the API used at the plugin edge. It includes daw extra state and
     // embeds the program as a subordinate node of the docuemtn
@@ -88,7 +90,25 @@ class StateManager final
         std::array<int, 128> controllers{};
 
         uint8_t selectedLFOIndex{0};
+        uint8_t selectedMPEDimension{0};
+        bool selectedMPEPanel{false};
+        bool selectedMTSESPPanel{false};
+
         float impliedScaleFactor{1.f};
+
+        MutateMask mutateSections;
+
+        bool mpeEnabled{false};
+        int mpePitchBendRange{48};
+
+        bool dynamicMTSESP{false};
+
+        bool lockPitchBend{false};
+        int pitchBendUpRange{2};
+        int pitchBendDownRange{2};
+
+        bool lockHQ{false};
+        bool highQuality{false};
 
         std::unique_ptr<juce::XmlElement> toElement() const;
         void fromElement(const juce::XmlElement *e);

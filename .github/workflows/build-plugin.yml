@@ -24,30 +24,30 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: windows-latest
+          - os: windows-2022
             name: windows-msvc-x64
             cmake_args: -Ax64
             upload_asset: true
             pr_build: Debug
 
-#          - os: windows-latest
+#          - os: windows-2022
 #            name: windows-clang
 #            cmake_args: -GNinja -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_COMPILER=clang
 #            upload_asset: true
 
-          - os: windows-latest
+          - os: windows-2022
             name: windows-arm64ec
             cmake_args: -G"Visual Studio 17 2022" -A arm64ec -DCMAKE_SYSTEM_VERSION=10 -DOBXF_EXTRA_ZIP_NAME="-arm64ec"
             upload_asset: true
             pr_build: Debug
 
-          - os: windows-latest
+          - os: windows-2022
             name: windows-arm64
             cmake_args: -G"Visual Studio 17 2022" -A arm64 -DCMAKE_SYSTEM_VERSION=10 -DOBXF_EXTRA_ZIP_NAME="-arm64"
             upload_asset: true
             pr_build: Debug
 
-          - os: windows-latest
+          - os: windows-2022
             name: windows-clang-cl
             cmake_args: -G"Visual Studio 17 2022" -A x64 -T ClangCL -DCMAKE_SYSTEM_VERSION=10 -DOBXF_EXTRA_ZIP_NAME="-clang-cl"
             upload_asset: false
@@ -77,11 +77,23 @@ jobs:
             upload_asset: false
             pr_build: Release
 
+          - name: ubuntu-arm
+            os: ubuntu-24.04-arm
+            cmake_args: -GNinja -DOBXF_EXTRA_ZIP_NAME=-ubuntu24.04-arm64
+            upload_asset: true
+            pr_build: Release
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
         with:
           submodules: recursive
+
+      - name: Select Xcode 26.2.0
+        if: runner.os == 'macOS'
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '26.2.0'
 
       - name: Prepare for JUCE
         uses: surge-synthesizer/sst-githubactions/prepare-for-juce@main
@@ -99,17 +111,25 @@ jobs:
           p12-password: ${{ secrets.CERT_PWD }}
 
 
+      - name: Configure release version (Nightly)
+        if: github.event_name != 'pull_request' && !startsWith(github.ref, 'refs/tags/v')
+        run: |
+          cmake -S . -B ./build ${{ matrix.cmake_args }} -DCMAKE_BUILD_TYPE=Release -DCOPY_PLUGIN_AFTER_BUILD=FALSE -DGITHUB_ACTIONS_BUILD=TRUE
+
+      - name: Configure release version (Release)
+        if: github.event_name != 'pull_request' && startsWith(github.ref, 'refs/tags/v')
+        run: |
+          cmake -S . -B ./build ${{ matrix.cmake_args }} -DCMAKE_BUILD_TYPE=Release -DCOPY_PLUGIN_AFTER_BUILD=FALSE -DGITHUB_ACTIONS_BUILD=TRUE -DOBXF_BUILD_VERSION=${{ github.ref_name }}
+
       - name: Build release version
         if: github.event_name != 'pull_request'
         run: |
-          echo "Doing a PR build with " ${{ matrix.pr_build }}
-          cmake -S . -B ./build ${{ matrix.cmake_args }} -DCMAKE_BUILD_TYPE=Release -DCOPY_PLUGIN_AFTER_BUILD=FALSE -DGITHUB_ACTIONS_BUILD=TRUE
           cmake --build ./build --config Release --target obxf-staged --parallel 3
 
       - name: Configure pull request version
         if: github.event_name == 'pull_request'
         run: |
-          cmake -S . -B ./build ${{ matrix.cmake_args }} -DCMAKE_BUILD_TYPE=${{ matrix.pr_build }} -DCOPY_AFTER_BUILD=FALSE  -DGITHUB_ACTIONS_BUILD=TRUE 
+          cmake -S . -B ./build ${{ matrix.cmake_args }} -DCMAKE_BUILD_TYPE=${{ matrix.pr_build }} -DCOPY_AFTER_BUILD=FALSE  -DGITHUB_ACTIONS_BUILD=TRUE
 
       - name: Build pull request version
         if: github.event_name == 'pull_request'
@@ -125,16 +145,24 @@ jobs:
         run: |
           cmake --build ./build --config Release --target obxf-installer --parallel 3
 
+
+      - name: Make linux zip and deb, but remove assets
+        if: github.event_name != 'pull_request' && runner.os == 'Linux'
+        run: |
+          cmake --build ./build --config Release --target obxf-installer --parallel 3
+          rm build/installer/*assets*
+          ls -l build/installer
+
       - name: Make Mac
         if: github.event_name != 'pull_request' && runner.os == 'macOS'
         run: |
           export MAC_SIGNING_CERT="${{ secrets.MAC_SIGNING_CERT_NAME }}"
           export MAC_INSTALLING_CERT="${{ secrets.MAC_INSTALLING_CERT_NAME }}"
-          
+
           export MAC_SIGNING_ID="${{ secrets.MAC_SIGNING_ID }}"
           export MAC_SIGNING_1UPW="${{ secrets.MAC_SIGNING_1UPW }}"
           export MAC_SIGNING_TEAM="${{ secrets.MAC_SIGNING_TEAM }}"
-          
+
           cmake --build ./build --config Release --target obxf-installer --parallel 3
 
       - name: Upload artifact
@@ -144,6 +172,32 @@ jobs:
           path: build/installer
           name: dawplugin-${{ matrix.name }}
 
+
+  test_plugin:
+    name: Test - Linux
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Prepare for JUCE
+        uses: surge-synthesizer/sst-githubactions/prepare-for-juce@main
+        with:
+          os: ${{ runner.os }}
+
+      - name: Configure
+        run: |
+          cmake -S . -B ./build -GNinja -DCMAKE_BUILD_TYPE=Release -DCOPY_PLUGIN_AFTER_BUILD=FALSE -DGITHUB_ACTIONS_BUILD=TRUE -DOBXF_BUILD_TESTS=TRUE
+
+      - name: Build tests
+        run: |
+          cmake --build ./build --target obxf-tests --parallel 3
+
+      - name: Run tests
+        run: |
+          ./build/src/tests/obxf-tests_artefacts/Release/obxf-tests
 
   build_plugin_docker:
     name: Build - Docker Ubuntu 20
@@ -155,13 +209,27 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Build in Docker
+      - name: Setup Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        id: cmake_extra
+        run: |
+          echo "This is a release build"
+          echo "cmake_extra_arg=-DOBXF_BUILD_VERSION=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      #- name: Setup Release
+      #  if: !startsWith(github.ref, 'refs/tags/v')
+      #  id: cmake_extra
+      #  run: |
+      #    echo "This is a release build"
+      #    echo "cmake_extra_arg=-DOBXF_BUILD_VERSION=FOOFOO" >> "$GITHUB_OUTPUT"
+
+      - name: Build in Docker Nightly
         uses: surge-synthesizer/sst-githubactions/cmake-in-docker@main
         with:
           image: ghcr.io/surge-synthesizer/sst-dockerimages/ubuntu20_gcc11:main
           username: ${{ github.actor }}
           token: ${{ secrets.GITHUB_TOKEN }}
-          cmakeArgs: -DCMAKE_BUILD_TYPE=Release -GNinja  -DCOPY_AFTER_BUILD=FALSE  -DGITHUB_ACTIONS_BUILD=TRUE
+          cmakeArgs: -DCMAKE_BUILD_TYPE=Release -GNinja  -DCOPY_AFTER_BUILD=FALSE  -DGITHUB_ACTIONS_BUILD=TRUE ${{ steps.cmake_extra.outputs.cmake_extra_arg }}
           target: obxf-installer
 
       - name: Show Installer Directory
@@ -197,7 +265,7 @@ jobs:
           webhook: ${{ secrets.DISCORD_OBXF_WEBHOOK }}
           tag: Nightly
           title: "A New OB-Xf Nightly build occurred"
-          subtitle: "The beta period is live. Enjoy!"
+          subtitle: "Headed towards 1.1"
 
       - name: Checkout for git info
         uses: actions/checkout@v6
@@ -225,35 +293,11 @@ jobs:
           releases: |
             {
                 "macos": "${{ github.server_url }}/surge-synthesizer/OB-Xf/releases/download/Nightly/ob-xf-macOS-${{ steps.obxf_version.outputs.obxf_date }}-${{ steps.obxf_version.outputs.version_chunk }}.dmg",
-                "win64": "${{ github.server_url }}/surge-synthesizer/OB-Xf/releases/download/Nightly/obxf-${{ steps.obxf_version.outputs.obxf_date }}-${{ steps.obxf_version.outputs.version_chunk }}-Windows.exe",
-                "win64zip": "${{ github.server_url }}/surge-synthesizer/OB-Xf/releases/download/Nightly/obxf-${{ steps.obxf_version.outputs.obxf_date }}-${{ steps.obxf_version.outputs.version_chunk }}-Windows.zip",
-                "linux64": "${{ github.server_url }}/surge-synthesizer/OB-Xf/releases/download/Nightly/obxf-${{ steps.obxf_version.outputs.obxf_date }}-${{ steps.obxf_version.outputs.version_chunk }}-Linux.deb",
+                "win64": "${{ github.server_url }}/surge-synthesizer/OB-Xf/releases/download/Nightly/ob-xf-Windows-${{ steps.obxf_version.outputs.obxf_date }}-${{ steps.obxf_version.outputs.version_chunk }}.exe",
+                "win64zip": "${{ github.server_url }}/surge-synthesizer/OB-Xf/releases/download/Nightly/ob-xf-Windows-${{ steps.obxf_version.outputs.obxf_date }}-${{ steps.obxf_version.outputs.version_chunk }}.zip",
+                "linux64": "${{ github.server_url }}/surge-synthesizer/OB-Xf/releases/download/Nightly/ob-xf-Linux-${{ steps.obxf_version.outputs.obxf_date }}-${{ steps.obxf_version.outputs.version_chunk }}.deb",
                 "other": "${{ github.server_url }}/surge-synthesizer/OB-Xf/releases/tag/Nightly"
             }
-
-  publish-plugin-rework:
-    name: Publish Rework Release
-    if: ${{ github.ref == 'refs/heads/rework' && github.repository_owner == 'surge-synthesizer' }}
-    runs-on: ubuntu-latest
-    needs: [build_plugin, build_plugin_docker]
-    steps:
-      - name: Upload to Rework
-        uses: surge-synthesizer/sst-githubactions/upload-to-release@main
-        with:
-          tag: ReWork
-          reuse_tag: true
-          create_tag: false
-          token: ${{ secrets.GITHUB_TOKEN }}
-          release_blurb_file: resources/ReworkBlurb.md
-
-
-      #- name: Post to Discord
-      #  uses: surge-synthesizer/sst-githubactions/discord-release-notify@main
-      #  with:
-      #    webhook: ${{ secrets.DISCORD_OBXF_WEBHOOK }}
-      #    tag: Nightly
-      #    title: "A New OB-Xf Rework build occurred"
-      #    subtitle: "Drawing Boards, Revisited. Enjoy!"
 
   publish-plugin-release:
     name: Publish Release
@@ -276,3 +320,21 @@ jobs:
           tag: ${{ github.ref_name }}
           title: "A New OB-Xf release occurred"
           subtitle: "Wow, go team!"
+
+      - name: Notify surge-synth-team.org
+        env:
+          GH_TOKEN: ${{ secrets.WEB }}
+        uses: surge-synthesizer/sst-githubactions/send-web-notification@main
+        with:
+          web_repo: "surge-synth-team.org"
+          event_type: "obxf-build-stable"
+          name: "ob-xf"
+          version: ${{ github.ref_name }}
+          releases: |
+            {
+                "macos": "${{ github.server_url }}/surge-synthesizer/OB-Xf/releases/download/${{ github.ref_name }}/ob-xf-macOS-${{ github.ref_name }}.dmg",
+                "win64": "${{ github.server_url }}/surge-synthesizer/OB-Xf/releases/download/${{ github.ref_name }}/ob-xf-Windows-${{ github.ref_name }}.exe",
+                "win64zip": "${{ github.server_url }}/surge-synthesizer/OB-Xf/releases/download/${{ github.ref_name }}/ob-xf-Windows-${{ github.ref_name}}.zip",
+                "linux64": "${{ github.server_url }}/surge-synthesizer/OB-Xf/releases/download/${{ github.ref_name }}/ob-xf-Linux-${{ github.ref_name }}.deb",
+                "other": "${{ github.server_url }}/surge-synthesizer/OB-Xf/releases/tag/${{ github.ref_name }}"
+            }

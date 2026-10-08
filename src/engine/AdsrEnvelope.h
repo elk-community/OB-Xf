@@ -1,16 +1,12 @@
 /*
- * OB-Xf - a continuation of the last open source version of OB-Xd.
- *
  * OB-Xd was originally written by Vadim Filatov, and then a version
  * was released under the GPL3 at https://github.com/reales/OB-Xd.
  * Subsequently, the product was continued by DiscoDSP and the copyright
- * holders as an excellent closed source product. For more info,
- * see "HISTORY.md" in the root of this repository.
+ * holders as an excellent closed source product.
  *
- * This repository is a successor to the last open source release,
- * a version marked as 2.11. Copyright 2013-2025 by the authors
- * as indicated in the original release, and subsequent authors
- * per the GitHub transaction log.
+ * This repository is a successor to OB-Xd version 2.11.
+ * Copyright 2013-2025 by the authors as indicated in the original release,
+ * and subsequent authors as per GitHub transaction log.
  *
  * OB-Xf is released under the GNU General Public Licence v3 or later
  * (GPL-3.0-or-later). The license is found in the file "LICENSE"
@@ -112,7 +108,7 @@ class ADSREnvelope
 
         if (state == State::Decay)
         {
-            coef = static_cast<float>((log(juce::jmin(par.s + 0.0001, 0.99)) - log(1.0)) /
+            coef = static_cast<float>((log(std::min(par.s + 0.0001, 0.99)) - log(1.0)) /
                                       (sampleRate * par.d * msToSec));
         }
     }
@@ -125,7 +121,7 @@ class ADSREnvelope
 
         if (state == State::Decay)
         {
-            coef = static_cast<float>((log(juce::jmin(par.s + 0.0001, 0.99)) - log(1.0)) /
+            coef = static_cast<float>((log(std::min(par.s + 0.0001, 0.99)) - log(1.0)) /
                                       (sampleRate * par.d * msToSec));
         }
     }
@@ -141,6 +137,24 @@ class ADSREnvelope
             coef = static_cast<float>((log(0.00001) - log(output + 0.0001)) /
                                       (sampleRate * par.r * msToSec));
         }
+    }
+
+    /* Apply a matrix-driven attack time without touching orig.a.
+     * Safe to call every sample — does not interfere with setEnvOffsets(). */
+    void applyMatrixAttack(float ms)
+    {
+        par.a = ms * offsetFactor / atkTimeAdjustment;
+        if (state == State::Attack)
+            updateAttackCoeff();
+    }
+
+    /* Apply a matrix-driven release time without touching orig.r. */
+    void applyMatrixRelease(float ms)
+    {
+        par.r = ms * offsetFactor;
+        if (state == State::Release)
+            coef = static_cast<float>((log(0.00001) - log(output + 0.0001)) /
+                                      (sampleRate * par.r * msToSec));
     }
 
     void triggerAttack()
@@ -194,7 +208,7 @@ class ADSREnvelope
         if (state == State::Attack)
         {
             auto to = (1 - attackCurve) * output + attackCurve * outputLin;
-            output = juce::jmin(to, 0.99f);
+            output = std::min(to, 0.99f);
         }
 
         if (state != State::Release)
@@ -222,9 +236,9 @@ class ADSREnvelope
             if (output - 1.f > -atkValueEnd)
             {
                 auto to = (1 - attackCurve) * output + attackCurve * outputLin;
-                output = juce::jmin(to, 0.99f);
+                output = std::min(to, 0.99f);
                 state = State::Decay;
-                coef = static_cast<float>((log(juce::jmin(par.s + 0.0001, 0.99)) - log(1.0)) /
+                coef = static_cast<float>((log(std::min(par.s + 0.0001, 0.99)) - log(1.0)) /
                                           (sampleRate * par.d * msToSec));
                 goto dec;
             }
@@ -248,7 +262,7 @@ class ADSREnvelope
             }
             break;
         case State::Sustain:
-            output = juce::jmin(par.s, 0.9f);
+            output = std::min(par.s, 0.9f);
             result = output;
             break;
         case State::Release:

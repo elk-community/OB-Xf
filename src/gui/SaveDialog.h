@@ -1,16 +1,12 @@
 /*
- * OB-Xf - a continuation of the last open source version of OB-Xd.
- *
  * OB-Xd was originally written by Vadim Filatov, and then a version
  * was released under the GPL3 at https://github.com/reales/OB-Xd.
  * Subsequently, the product was continued by DiscoDSP and the copyright
- * holders as an excellent closed source product. For more info,
- * see "HISTORY.md" in the root of this repository.
+ * holders as an excellent closed source product.
  *
- * This repository is a successor to the last open source release,
- * a version marked as 2.11. Copyright 2013-2025 by the authors
- * as indicated in the original release, and subsequent authors
- * per the GitHub transaction log.
+ * This repository is a successor to OB-Xd version 2.11.
+ * Copyright 2013-2025 by the authors as indicated in the original release,
+ * and subsequent authors as per GitHub transaction log.
  *
  * OB-Xf is released under the GNU General Public Licence v3 or later
  * (GPL-3.0-or-later). The license is found in the file "LICENSE"
@@ -31,7 +27,7 @@
 #include "gui/Display.h"
 #include "gui/ToggleButton.h"
 
-#include "PluginEditor.h"
+#include "ObxfEditor.h"
 
 struct SaveDialog : juce::Component
 {
@@ -40,6 +36,7 @@ struct SaveDialog : juce::Component
     std::unique_ptr<juce::Drawable> saveDialogSVG;
     bool hasSkinImage{false};
     std::unordered_map<std::string, juce::Rectangle<int>> boundsMap;
+    std::unordered_map<std::string, juce::Colour> colorMap;
 
     SaveDialog(ObxfAudioProcessorEditor &editor) : editor(editor)
     {
@@ -50,12 +47,12 @@ struct SaveDialog : juce::Component
         resetState();
 
         ok = std::make_unique<ToggleButton>("button-clear-red", 35, editor.imageCache,
-                                            &editor.processor, true);
+                                            &editor.processor, false);
         ok->onClick = [this] { doSave(); };
         addAndMakeVisible(*ok);
 
         cancel = std::make_unique<ToggleButton>("button-clear-white", 35, editor.imageCache,
-                                                &editor.processor, true);
+                                                &editor.processor, false);
         cancel->onClick = [this] { setVisible(false); };
         addAndMakeVisible(*cancel);
 
@@ -66,7 +63,7 @@ struct SaveDialog : juce::Component
         addAndMakeVisible(*author);
 
         category = std::make_unique<ButtonList>("menu-categories", 31, editor.imageCache,
-                                                &editor.processor, true);
+                                                &editor.processor, false);
         addAndMakeVisible(*category);
 
         category->addItem("None", noCatID);
@@ -87,12 +84,10 @@ struct SaveDialog : juce::Component
 
     void resetState()
     {
-        hasSkinImage = false;
-        if (editor.imageCache.hasImageFor("label-bg-save-patch"))
-        {
-            hasSkinImage = true;
-        }
+        hasSkinImage = editor.imageCache.hasImageFor("label-bg-save-patch");
+
         boundsMap.clear();
+        colorMap.clear();
     }
 
     void doQuickSave()
@@ -165,8 +160,17 @@ struct SaveDialog : juce::Component
         setVisible(false);
     }
 
+    void scaleFactorChanged()
+    {
+        ok->scaleFactorChanged();
+        cancel->scaleFactorChanged();
+        category->scaleFactorChanged();
+    }
+
     void resized() override
     {
+        scaleFactorChanged();
+
         auto sc = editor.impliedScaleFactor();
         auto bx = getContentArea();
 
@@ -188,7 +192,7 @@ struct SaveDialog : juce::Component
         auto cancelBounds  = lookup("savePatchCancelButton",  129, 272,  23, 35);
         auto okBounds      = lookup("savePatchOKButton",       92, 272,  23, 35);
 
-        auto toR = [&bx, sc](const juce::Rectangle<int> &r)
+        auto toRect = [&bx, sc](const juce::Rectangle<int> &r)
         {
             return juce::Rectangle<int>(r.getX() * sc + bx.getX(),
                                         r.getY() * sc + bx.getY(),
@@ -197,13 +201,13 @@ struct SaveDialog : juce::Component
         };
         // clang-format on
 
-        name->setBounds(toR(nameBounds));
-        author->setBounds(toR(authorBounds));
-        project->setBounds(toR(projectBounds));
-        category->setBounds(toR(catBounds));
-        license->setBounds(toR(licBounds));
-        cancel->setBounds(toR(cancelBounds));
-        ok->setBounds(toR(okBounds));
+        name->setBounds(toRect(nameBounds));
+        author->setBounds(toRect(authorBounds));
+        project->setBounds(toRect(projectBounds));
+        category->setBounds(toRect(catBounds));
+        license->setBounds(toRect(licBounds));
+        cancel->setBounds(toRect(cancelBounds));
+        ok->setBounds(toRect(okBounds));
     }
 
     void paint(juce::Graphics &g) override
@@ -218,7 +222,7 @@ struct SaveDialog : juce::Component
         {
             if (editor.imageCache.isSVG("label-bg-save-patch"))
             {
-                auto &svg = editor.imageCache.getSVGDrawable("label-bg-save-patch", 0);
+                auto &svg = editor.imageCache.getSVGDrawable("label-bg-save-patch");
                 auto at = juce::AffineTransform().scaled(sc).translated(r.getX(), r.getY());
                 svg->draw(g, 1.0, at);
             }
@@ -304,24 +308,29 @@ struct SaveDialog : juce::Component
 
         getPatchInfo();
 
-        auto format = [this](Display &comp) {
+        auto getColor = [this](const std::string &key) -> juce::Colour {
+            auto it = colorMap.find(key);
+            return it != colorMap.end() ? it->second : juce::Colours::red;
+        };
+
+        auto format = [this](Display &comp, juce::Colour color) {
             comp.setFont(editor.patchNameFont.withHeight(18.f));
             comp.setJustificationType(juce::Justification::centred);
             comp.setMinimumHorizontalScale(1.f);
-            comp.setColour(juce::Label::textColourId, juce::Colours::red);
-            comp.setColour(juce::Label::textWhenEditingColourId, juce::Colours::red);
+            comp.setColour(juce::Label::textColourId, color);
+            comp.setColour(juce::Label::textWhenEditingColourId, color);
             comp.setColour(juce::Label::outlineWhenEditingColourId,
                            juce::Colours::transparentBlack);
-            comp.setColour(juce::TextEditor::textColourId, juce::Colours::red);
-            comp.setColour(juce::TextEditor::highlightedTextColourId, juce::Colours::red);
-            comp.setColour(juce::TextEditor::highlightColourId, juce::Colour(0x30FFFFFF));
-            comp.setColour(juce::CaretComponent::caretColourId, juce::Colours::red);
+            comp.setColour(juce::TextEditor::textColourId, color);
+            comp.setColour(juce::TextEditor::highlightedTextColourId, color);
+            comp.setColour(juce::TextEditor::highlightColourId, juce::Colour(0x20FFFFFF));
+            comp.setColour(juce::CaretComponent::caretColourId, color);
         };
 
-        format(*name);
-        format(*project);
-        format(*author);
-        format(*license);
+        format(*name, getColor("savePatchNameLabel"));
+        format(*project, getColor("savePatchProjectLabel"));
+        format(*author, getColor("savePatchAuthorLabel"));
+        format(*license, getColor("savePatchLicenseLabel"));
 
         setVisible(true);
         toFront(true);
@@ -329,7 +338,7 @@ struct SaveDialog : juce::Component
 
     std::unique_ptr<ToggleButton> ok, cancel;
     std::unique_ptr<Display> name, author, license, project;
-    std::unique_ptr<juce::ComboBox> category;
+    std::unique_ptr<ButtonList> category;
 };
 
 #endif // OB_XF_SAVEDIALOG_H

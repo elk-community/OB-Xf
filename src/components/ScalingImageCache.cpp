@@ -1,16 +1,12 @@
 /*
- * OB-Xf - a continuation of the last open source version of OB-Xd.
- *
  * OB-Xd was originally written by Vadim Filatov, and then a version
  * was released under the GPL3 at https://github.com/reales/OB-Xd.
  * Subsequently, the product was continued by DiscoDSP and the copyright
- * holders as an excellent closed source product. For more info,
- * see "HISTORY.md" in the root of this repository.
+ * holders as an excellent closed source product.
  *
- * This repository is a successor to the last open source release,
- * a version marked as 2.11. Copyright 2013-2025 by the authors
- * as indicated in the original release, and subsequent authors
- * per the GitHub transaction log.
+ * This repository is a successor to OB-Xd version 2.11.
+ * Copyright 2013-2025 by the authors as indicated in the original release,
+ * and subsequent authors as per GitHub transaction log.
  *
  * OB-Xf is released under the GNU General Public Licence v3 or later
  * (GPL-3.0-or-later). The license is found in the file "LICENSE"
@@ -70,7 +66,17 @@ juce::Image ScalingImageCache::initializeImage(const std::string &label)
         return {};
 
     if (cachePaths.find(label) != cachePaths.end())
-        return {};
+    {
+        // cachePaths exists but svgLayers might not if a previous call
+        // populated paths but was interrupted before svg loading
+        if (svgLayers.find(label) == svgLayers.end())
+        {
+            // don't early-exit, fall through to re-populate svgLayers
+            cachePaths.erase(label);
+        }
+        else
+            return {};
+    }
 
     if (embeddedMode)
     {
@@ -285,5 +291,6 @@ int ScalingImageCache::getSvgLayerCount(const std::string &label)
 std::unique_ptr<juce::Drawable> &ScalingImageCache::getSVGDrawable(const std::string &label,
                                                                    int layer)
 {
+    initializeImage(label);
     return svgLayers[label][layer];
 }

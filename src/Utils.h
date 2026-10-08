@@ -1,16 +1,12 @@
 /*
- * OB-Xf - a continuation of the last open source version of OB-Xd.
- *
  * OB-Xd was originally written by Vadim Filatov, and then a version
  * was released under the GPL3 at https://github.com/reales/OB-Xd.
  * Subsequently, the product was continued by DiscoDSP and the copyright
- * holders as an excellent closed source product. For more info,
- * see "HISTORY.md" in the root of this repository.
+ * holders as an excellent closed source product.
  *
- * This repository is a successor to the last open source release,
- * a version marked as 2.11. Copyright 2013-2025 by the authors
- * as indicated in the original release, and subsequent authors
- * per the GitHub transaction log.
+ * This repository is a successor to OB-Xd version 2.11.
+ * Copyright 2013-2025 by the authors as indicated in the original release,
+ * and subsequent authors as per GitHub transaction log.
  *
  * OB-Xf is released under the GNU General Public Licence v3 or later
  * (GPL-3.0-or-later). The license is found in the file "LICENSE"
@@ -28,19 +24,11 @@
 #include <fmt/core.h>
 #include "filesystem/import.h"
 
+#include "Program.h"
 #include "Constants.h"
+#include <engine/ParamScales.h> // linsc, logsc
 
-inline static float getPitch(float index) { return 440.f * expf(mult * index); };
-
-inline static float linsc(float param, const float min, const float max)
-{
-    return (param) * (max - min) + min;
-}
-
-inline static float logsc(float param, const float min, const float max, const float rolloff = 19.f)
-{
-    return ((expf(param * logf(rolloff + 1.f)) - 1.f) / (rolloff)) * (max - min) + min;
-}
+inline static float getPitch(float index) { return 440.f * std::exp(mult * index); };
 
 inline std::string humanReadableVersion(const uint64_t v)
 {
@@ -50,11 +38,25 @@ inline std::string humanReadableVersion(const uint64_t v)
 inline uint64_t fromHumanReadableVersion(const std::string &v)
 {
     if (v.size() != 10)
+    {
         return 0;
-    if (v[4] != '-' && v[7] != '-')
+    }
+
+    if (v[4] != '-' || v[7] != '-')
+    {
         return 0;
-    return std::stoul(v.substr(0, 4), nullptr, 16) << 16 |
-           std::stoul(v.substr(5, 2), nullptr, 16) << 8 | std::stoul(v.substr(8, 2), nullptr, 16);
+    }
+
+    try
+    {
+        return std::stoul(v.substr(0, 4), nullptr, 16) << 16 |
+               std::stoul(v.substr(5, 2), nullptr, 16) << 8 |
+               std::stoul(v.substr(8, 2), nullptr, 16);
+    }
+    catch (const std::exception &)
+    {
+        return 0;
+    }
 }
 
 class Utils final
@@ -108,6 +110,7 @@ class Utils final
         LocationType locationType;
         juce::String dirName;
         juce::File file;
+        bool isPinnedDefault{false};
 
         bool operator==(const ThemeLocation &other) const
         {
@@ -240,8 +243,13 @@ class Utils final
     // Load save and init patch
     bool loadPatch(const PatchTreeNode::ptr_t &fxpFile);
     bool loadPatch(const juce::File &fxpFile);
+    bool loadPatch(const juce::File &fxpFile, Program &program);
     bool savePatch(const juce::File &fxpFile);
     void initializePatch() const;
+
+    // Serialize an arbitrary Program (not necessarily the active one) into a MemoryBlock
+    // Used by the OB-Xd importer to write individual patches
+    bool serializeProgramToMemoryBlock(const Program &program, juce::MemoryBlock &out) const;
 
     // copy paste and detect a serialized FXP onto clipboard
     void copyPatch();
@@ -251,6 +259,7 @@ class Utils final
     // callbacks
     std::function<void(int idx)> hostUpdateCallback;
     std::function<bool(juce::MemoryBlock &)> loadMemoryBlockCallback;
+    std::function<bool(juce::MemoryBlock &, Program &)> loadMemoryBlockOntoProgramCallback;
     std::function<void(juce::MemoryBlock &)> getProgramStateInformation;
     std::function<void(char *, int)> copyTruncatedProgramNameToFXPBuffer;
     std::function<void()> resetPatchToDefault;
@@ -276,7 +285,6 @@ class Utils final
 
     LocationType resolvedFactoryLocationType{SYSTEM_FACTORY};
 
-    void updateConfig();
     bool serializePatchAsFXPOnto(juce::MemoryBlock &memoryBlock) const;
     bool isMemoryBlockAPatch(const juce::MemoryBlock &mb);
 

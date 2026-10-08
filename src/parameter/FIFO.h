@@ -1,16 +1,12 @@
 /*
- * OB-Xf - a continuation of the last open source version of OB-Xd.
- *
  * OB-Xd was originally written by Vadim Filatov, and then a version
  * was released under the GPL3 at https://github.com/reales/OB-Xd.
  * Subsequently, the product was continued by DiscoDSP and the copyright
- * holders as an excellent closed source product. For more info,
- * see "HISTORY.md" in the root of this repository.
+ * holders as an excellent closed source product.
  *
- * This repository is a successor to the last open source release,
- * a version marked as 2.11. Copyright 2013-2025 by the authors
- * as indicated in the original release, and subsequent authors
- * per the GitHub transaction log.
+ * This repository is a successor to OB-Xd version 2.11.
+ * Copyright 2013-2025 by the authors as indicated in the original release,
+ * and subsequent authors as per GitHub transaction log.
  *
  * OB-Xf is released under the GNU General Public Licence v3 or later
  * (GPL-3.0-or-later). The license is found in the file "LICENSE"
@@ -27,6 +23,8 @@
 #include <array>
 #include <cstring>
 
+#include <configuration.h>
+
 #ifdef _MSC_VER
 #define OBXF_SRC_PARAMETER_FIFO_H
 #include <cstring>
@@ -39,7 +37,7 @@ constexpr size_t kMaxParamIdLen = 32;
 struct ParameterChange
 {
     char parameterID[kMaxParamIdLen]{};
-    float newValue;
+    float newValue{0.f};
 
     ParameterChange() : parameterID{0}, newValue{0.f} {}
     ParameterChange(const juce::String &id, const float value) : newValue(value)
@@ -66,12 +64,19 @@ template <size_t Capacity> class FIFO
     bool pushParameter(const juce::String &parameterID, float newValue)
     {
         if (abstractFIFO.getFreeSpace() == 0)
+        {
+            OBLOG(params, "Could not get free space in FIFO queue!");
             return false;
+        }
+
         auto scope = abstractFIFO.write(1);
+
         if (scope.blockSize1 > 0)
             buffer[scope.startIndex1] = ParameterChange(parameterID, newValue);
+
         if (scope.blockSize2 > 0)
             buffer[scope.startIndex2] = ParameterChange(parameterID, newValue);
+
         return true;
     }
 

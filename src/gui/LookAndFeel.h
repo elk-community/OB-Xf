@@ -1,16 +1,12 @@
 /*
- * OB-Xf - a continuation of the last open source version of OB-Xd.
- *
  * OB-Xd was originally written by Vadim Filatov, and then a version
  * was released under the GPL3 at https://github.com/reales/OB-Xd.
  * Subsequently, the product was continued by DiscoDSP and the copyright
- * holders as an excellent closed source product. For more info,
- * see "HISTORY.md" in the root of this repository.
+ * holders as an excellent closed source product.
  *
- * This repository is a successor to the last open source release,
- * a version marked as 2.11. Copyright 2013-2025 by the authors
- * as indicated in the original release, and subsequent authors
- * per the GitHub transaction log.
+ * This repository is a successor to OB-Xd version 2.11.
+ * Copyright 2013-2025 by the authors as indicated in the original release,
+ * and subsequent authors as per GitHub transaction log.
  *
  * OB-Xf is released under the GNU General Public Licence v3 or later
  * (GPL-3.0-or-later). The license is found in the file "LICENSE"
@@ -25,6 +21,13 @@
 
 #include "juce_gui_basics/juce_gui_basics.h"
 #include "BinaryData.h"
+
+#include "configuration.h"
+
+namespace juce
+{
+class AudioProcessorEditor;
+}
 
 class ObxfAudioProcessorEditor;
 
@@ -99,8 +102,41 @@ class LookAndFeel final : public juce::LookAndFeel_V4
         setColour(juce::BubbleComponent::ColourIds::outlineColourId,
                   juce::Colour(64, 64, 64).withAlpha(0.6f));
         setColour(juce::TooltipWindow::textColourId, juce::Colours::white);
+    }
 
-        setColour(juce::ComboBox::textColourId, juce::Colours::transparentBlack);
+    void getIdealPopupMenuItemSize(const juce::String &text, bool isSeparator, int targetHeight,
+                                   int &width, int &height) override
+    {
+        juce::LookAndFeel_V4::getIdealPopupMenuItemSize(text, isSeparator, targetHeight, width,
+                                                        height);
+
+        // if menu item is a #GHOST#, make its height equal to section header + separator
+        if (text == "#GHOST#")
+        {
+            int headerHeight = height;
+            int separatorHeight = 0;
+            int dummyWidth = 0;
+
+            // Fetch the standard separator height from the LookAndFeel
+            juce::LookAndFeel_V4::getIdealPopupMenuItemSize({}, true, targetHeight, dummyWidth,
+                                                            separatorHeight);
+
+            height = headerHeight + separatorHeight;
+            width = dummyWidth;
+        }
+    }
+
+    void drawPopupMenuSectionHeader(juce::Graphics &g, const juce::Rectangle<int> &area,
+                                    const juce::String &sectionName) override
+    {
+        if (sectionName == "#GHOST#")
+            return; // Draw nothing, leaving an empty gap
+
+        g.setFont(getPopupMenuFont().boldened());
+        g.setColour(findColour(juce::PopupMenu::headerTextColourId));
+
+        g.drawFittedText(sectionName, area.getX() + 12, area.getY(), area.getWidth() - 16,
+                         (int)((float)area.getHeight() * 0.8f), juce::Justification::bottomLeft, 1);
     }
 
     void drawDocumentWindowTitleBar(juce::DocumentWindow &window, juce::Graphics &g, const int w,
@@ -215,6 +251,54 @@ class LookAndFeel final : public juce::LookAndFeel_V4
         return juce::BubbleComponent::BubblePlacement::above;
     }
 
+    // temporary hack for MPE matrix
+    void drawLinearSlider(juce::Graphics &g, int x, int y, int width, int height, float sliderPos,
+                          float minSliderPos, float maxSliderPos, juce::Slider::SliderStyle style,
+                          juce::Slider &slider) override
+    {
+        /* Bipolar sliders (range spans zero) fill from the zero crossing toward the thumb
+         * rather than from the left edge, giving an intuitive +/- visual.
+         */
+        if (style == juce::Slider::LinearHorizontal && slider.getMinimum() == -slider.getMaximum())
+        {
+            constexpr float trackThickness = 4.0f;
+            const float trackY = y + (height - trackThickness) * 0.5f;
+            const auto trackRect = juce::Rectangle<float>(
+                static_cast<float>(x), trackY, static_cast<float>(width), trackThickness);
+
+            g.setColour(
+                slider.findColour(juce::Slider::thumbColourId).darker(0.8f).withAlpha(0.5f));
+            g.fillRect(trackRect);
+
+            const float zeroFrac = static_cast<float>(-slider.getMinimum() /
+                                                      (slider.getMaximum() - slider.getMinimum()));
+            const float zeroX = static_cast<float>(x) + zeroFrac * static_cast<float>(width);
+
+            const auto fillRect =
+                (sliderPos >= zeroX)
+                    ? juce::Rectangle<float>(zeroX, trackY, sliderPos - zeroX, trackThickness)
+                    : juce::Rectangle<float>(sliderPos, trackY, zeroX - sliderPos, trackThickness);
+            g.setColour(slider.findColour(juce::Slider::thumbColourId));
+            g.fillRect(fillRect);
+
+            g.setColour(slider.findColour(juce::Slider::thumbColourId).withAlpha(0.5f));
+            g.drawVerticalLine(juce::roundToInt(zeroX), trackY - 2.f,
+                               trackY + trackThickness + 2.f);
+
+            const float thumbW = 8.0f;
+            const float thumbH = static_cast<float>(height) * 0.65f;
+            g.setColour(slider.findColour(juce::Slider::thumbColourId));
+            g.fillRect(juce::Rectangle<float>(sliderPos - thumbW * 0.5f,
+                                              y + (static_cast<float>(height) - thumbH) * 0.5f,
+                                              thumbW, thumbH));
+        }
+        else
+        {
+            juce::LookAndFeel_V4::drawLinearSlider(g, x, y, width, height, sliderPos, minSliderPos,
+                                                   maxSliderPos, style, slider);
+        }
+    }
+
     juce::PopupMenu::Options getOptionsForComboBoxPopupMenu(juce::ComboBox &b,
                                                             juce::Label &l) override
     {
@@ -222,14 +306,22 @@ class LookAndFeel final : public juce::LookAndFeel_V4
         // clipped it's ugly but I'm fine with it because we're not gonna have a ButtonList that has
         // more entries than this
         return juce::LookAndFeel_V4::getOptionsForComboBoxPopupMenu(b, l).withItemThatMustBeVisible(
-            256 /* MAX_PROGRAMS*/);
+            MAX_PROGRAMS);
     }
 
     juce::PopupMenu::Options defaultPopupMenuOptions();
+
     float menuScaleFactor() const;
+
+    juce::Colour textInputColour{juce::Colours::red};
+
+    juce::PopupMenu modifyHostMenu(juce::PopupMenu menu);
+
+    float editorScaleFactor() const;
 
   private:
     std::unique_ptr<juce::Drawable> svgIcon;
+
     void loadSvgIcon()
     {
         const juce::String svgString =
@@ -245,6 +337,8 @@ class LookAndFeel final : public juce::LookAndFeel_V4
     }
     ObxfAudioProcessorEditor *editor;
 };
+
+bool useHostContextMenus(juce::AudioProcessorEditor *editor);
 
 inline LookAndFeel *obxfLookAndFeel(juce::Component *that)
 {

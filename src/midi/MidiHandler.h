@@ -1,16 +1,12 @@
 /*
- * OB-Xf - a continuation of the last open source version of OB-Xd.
- *
  * OB-Xd was originally written by Vadim Filatov, and then a version
  * was released under the GPL3 at https://github.com/reales/OB-Xd.
  * Subsequently, the product was continued by DiscoDSP and the copyright
- * holders as an excellent closed source product. For more info,
- * see "HISTORY.md" in the root of this repository.
+ * holders as an excellent closed source product.
  *
- * This repository is a successor to the last open source release,
- * a version marked as 2.11. Copyright 2013-2025 by the authors
- * as indicated in the original release, and subsequent authors
- * per the GitHub transaction log.
+ * This repository is a successor to OB-Xd version 2.11.
+ * Copyright 2013-2025 by the authors as indicated in the original release,
+ * and subsequent authors as per GitHub transaction log.
  *
  * OB-Xf is released under the GNU General Public Licence v3 or later
  * (GPL-3.0-or-later). The license is found in the file "LICENSE"
@@ -32,11 +28,12 @@
 
 class SynthEngine;
 class MidiMap;
+class ObxfProcessor;
 
 class MidiHandler
 {
   public:
-    MidiHandler(SynthEngine &s, MidiMap &b, ParameterCoordinator &pm);
+    MidiHandler(SynthEngine &s, MidiMap &b, ParameterCoordinator &pm, ObxfAudioProcessor &proc);
     ~MidiHandler();
 
     void setSampleRate(double sampleRate); // for midi cc smoothing
@@ -58,8 +55,6 @@ class MidiHandler
 
     [[nodiscard]] juce::String getCurrentMidiPath() const { return currentMidiPath; }
 
-    std::function<void(int)> handleMIDIProgramChangeCallback;
-
     int getLastUsedParameter() const { return lastUsedParameter; }
     void clearLastUsedParameter() { lastUsedParameter = 0; }
 
@@ -71,7 +66,9 @@ class MidiHandler
     void snapLags();
     void processLags();
 
+    std::function<void(int)> handleMIDIProgramChangeCallback;
     std::function<void(const juce::MidiMessage &)> onMidiMessageCallback;
+    std::function<void()> onMidiLearnBinding;
 
   private:
     SynthEngine &synth;
@@ -84,8 +81,18 @@ class MidiHandler
     std::atomic<bool> midiControlledParamSet{false};
     int lastMovedController{0};
     std::atomic<int> lastUsedParameter{0};
+
+  public:
+    std::atomic<bool> mpeEnabled{false};
+    std::atomic<int> mpePitchBendRange{48};
+
+  private:
     int midiEventPos{0};
     uint8_t bankSelectMSB{0};
+    uint8_t rpnMSB{127};
+    uint8_t rpnLSB{127};
+    uint8_t dataEntryMSB{0};
+    uint8_t dataEntryLSB{0};
 
     juce::String currentMidiPath;
 
@@ -93,6 +100,10 @@ class MidiHandler
     std::unique_ptr<LagHandler> lagHandler;
     size_t lagPos{0};
     friend struct LagHandler;
+
+    void handleRPN();
+
+    ObxfAudioProcessor &processor;
 };
 
 #endif // OBXF_SRC_MIDI_MIDIHANDLER_H

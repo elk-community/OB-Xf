@@ -1,16 +1,12 @@
 /*
- * OB-Xf - a continuation of the last open source version of OB-Xd.
- *
  * OB-Xd was originally written by Vadim Filatov, and then a version
  * was released under the GPL3 at https://github.com/reales/OB-Xd.
  * Subsequently, the product was continued by DiscoDSP and the copyright
- * holders as an excellent closed source product. For more info,
- * see "HISTORY.md" in the root of this repository.
+ * holders as an excellent closed source product.
  *
- * This repository is a successor to the last open source release,
- * a version marked as 2.11. Copyright 2013-2025 by the authors
- * as indicated in the original release, and subsequent authors
- * per the GitHub transaction log.
+ * This repository is a successor to OB-Xd version 2.11.
+ * Copyright 2013-2025 by the authors as indicated in the original release,
+ * and subsequent authors as per GitHub transaction log.
  *
  * OB-Xf is released under the GNU General Public Licence v3 or later
  * (GPL-3.0-or-later). The license is found in the file "LICENSE"
@@ -26,14 +22,15 @@
 #include <juce_audio_processors/juce_audio_processors.h>
 
 /**
- * Attachment hooks a widget up to a parameter. It has templtae params for the
- * control and on whether to eject begin/end gestures when grabbed (which allow
- * button lists to supress that on drag gestures). It can also take an optiona get/set
- * function if the control doesn't support standard setvalue / getvalue semantics.
+ * Attachment hooks a widget up to a parameter. It has template parameters for the
+ * control and whether to eject begin/end gestures when grabbed (which allow
+ * button lists to supress that on drag gestures). It can also take an optional get/set
+ * function if the control doesn't support standard setValue/getValue semantics.
  *
- * It also registeres the UI callback so that engine-side updates to params in their
- * callback processing up date the state.
+ * It also registeres the UI callback so that engine side updates to params in their
+ * callback processing update the state.
  */
+
 template <typename Control, bool beginEditFromDrag> class Attachment
 {
   public:
@@ -85,16 +82,16 @@ template <typename Control, bool beginEditFromDrag> class Attachment
             };
         }
 
-        // this is for engine -> ui side communication. Basically if we
-        // arent in a drag or update push the value
+        // this is for engine -> UI side communication.
+        // Basically if we aren't in a drag or update, push the value.
         paramCallback = [cwp = juce::Component::SafePointer(&controlRef), this](float value, bool) {
             if (updating)
                 return;
             juce::MessageManager::callAsync([cwp, that = this, value]() {
                 if (!cwp)
                 {
-                    // In between the message getting generated and now the control has gone
-                    // away on screen either from editor closing or from ui having some
+                    // In between the message getting generated and now, the control has gone
+                    // away on screen either from editor closing or from UI having some
                     // other transformation or rebuild.
                     return;
                 }
@@ -114,7 +111,7 @@ template <typename Control, bool beginEditFromDrag> class Attachment
     ~Attachment() { updateHandler.removeParameterCallback(parameter->paramID, "UI"); }
 
     // This forces the parameter onto the widget. It's called for instance when
-    // we ahve a full update in Plugineditor
+    // we have a full update in PluginEditor
     void updateToControl()
     {
         if (parameter)

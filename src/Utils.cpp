@@ -1,16 +1,12 @@
 /*
- * OB-Xf - a continuation of the last open source version of OB-Xd.
- *
  * OB-Xd was originally written by Vadim Filatov, and then a version
  * was released under the GPL3 at https://github.com/reales/OB-Xd.
  * Subsequently, the product was continued by DiscoDSP and the copyright
- * holders as an excellent closed source product. For more info,
- * see "HISTORY.md" in the root of this repository.
+ * holders as an excellent closed source product.
  *
- * This repository is a successor to the last open source release,
- * a version marked as 2.11. Copyright 2013-2025 by the authors
- * as indicated in the original release, and subsequent authors
- * per the GitHub transaction log.
+ * This repository is a successor to OB-Xd version 2.11.
+ * Copyright 2013-2025 by the authors as indicated in the original release,
+ * and subsequent authors as per GitHub transaction log.
  *
  * OB-Xf is released under the GNU General Public Licence v3 or later
  * (GPL-3.0-or-later). The license is found in the file "LICENSE"
@@ -27,6 +23,47 @@
 #include "sst/plugininfra/strnatcmp.h"
 #include "Utils.h"
 
+#include <algorithm>
+
+namespace
+{
+#if JUCE_IOS
+void copyDirectoryContents(const juce::File &sourceRoot, const juce::File &destRoot)
+{
+    if (!sourceRoot.isDirectory())
+        return;
+
+    destRoot.createDirectory();
+
+    for (const auto &entry :
+         juce::RangedDirectoryIterator(sourceRoot, true, "*", juce::File::findFilesAndDirectories))
+    {
+        const auto source = entry.getFile();
+        const auto relativePath = source.getRelativePathFrom(sourceRoot);
+        const auto target = destRoot.getChildFile(relativePath);
+
+        if (source.isDirectory())
+        {
+            target.createDirectory();
+        }
+        else
+        {
+            target.getParentDirectory().createDirectory();
+            source.copyFileTo(target);
+        }
+    }
+}
+
+int countFilesRecursive(const juce::File &root, const juce::String &glob)
+{
+    if (!root.isDirectory())
+        return 0;
+
+    return root.findChildFiles(juce::File::findFiles, true, glob).size();
+}
+#endif
+} // namespace
+
 Utils::Utils() : configLock("__" JucePlugin_Name "ConfigLock__")
 {
 #if defined(DEBUG) || defined(_DEBUG)
@@ -38,6 +75,9 @@ Utils::Utils() : configLock("__" JucePlugin_Name "ConfigLock__")
 #endif
 
     createDocumentFolderIfMissing();
+#if JUCE_IOS
+    juce::Logger::writeToLog("[OB-Xf iOS bootstrap] Utils initialized");
+#endif
     resolveFactoryFolderInUse();
 
     juce::PropertiesFile::Options options;
@@ -201,6 +241,7 @@ void Utils::setCurrentThemeLocation(const Utils::ThemeLocation &loc)
 void Utils::setGuiSize(const int gui_size)
 {
     this->gui_size = gui_size;
+
     config->setValue("gui_size", gui_size);
     config->setNeedsToBeSaved(true);
 }
@@ -209,28 +250,82 @@ void Utils::scanAndUpdateThemes()
 {
     themeLocations.clear();
 
-    for (auto &t : {resolvedFactoryLocationType, LocationType::EMBEDDED, LocationType::USER})
+    // "Default" and "Default Vector" are themes we want to have first in the list.
+    // One lives on disk (factory folder), the other is baked into the binary (EMBEDDED).
+
+    static const std::vector<juce::String> pinnedFactoryThemes{"Default", "Default Vector"};
+
+    auto pinnedRank = [](const juce::String &name) -> int {
+        auto it = std::find(pinnedFactoryThemes.begin(), pinnedFactoryThemes.end(), name);
+
+        if (it == pinnedFactoryThemes.end())
+        {
+            return (int)pinnedFactoryThemes.size();
+        }
+
+        return (int)std::distance(pinnedFactoryThemes.begin(), it);
+    };
+
+    std::vector<ThemeLocation> factoryThemes;
+
+    for (auto &t : {resolvedFactoryLocationType, LocationType::EMBEDDED})
     {
         if (t == LocationType::EMBEDDED)
         {
-            themeLocations.emplace_back(t, embeddedThemeSentinel.getFileName(),
-                                        embeddedThemeSentinel);
+            factoryThemes.emplace_back(t, embeddedThemeSentinel.getFileName(),
+                                       embeddedThemeSentinel);
         }
         else
         {
             auto dir = getThemeFolderFor(t);
+
             for (const auto &entry :
                  juce::RangedDirectoryIterator(dir, false, "*", juce::File::findDirectories))
             {
-                themeLocations.emplace_back(t, entry.getFile().getFileName(), entry.getFile());
+                factoryThemes.emplace_back(t, entry.getFile().getFileName(), entry.getFile());
             }
         }
     }
+
+    std::stable_sort(factoryThemes.begin(), factoryThemes.end(),
+                     [&pinnedRank](const ThemeLocation &a, const ThemeLocation &b) {
+                         auto ra = pinnedRank(a.dirName);
+                         auto rb = pinnedRank(b.dirName);
+
+                         if (ra != rb)
+                             return ra < rb;
+
+                         return strnatcasecmp(a.dirName.toRawUTF8(), b.dirName.toRawUTF8()) < 0;
+                     });
+
+    for (auto &theme : factoryThemes)
+    {
+        theme.isPinnedDefault = pinnedRank(theme.dirName) < (int)pinnedFactoryThemes.size();
+    }
+
+    themeLocations.insert(themeLocations.end(), factoryThemes.begin(), factoryThemes.end());
+
+    std::vector<ThemeLocation> userThemes;
+    auto userDir = getThemeFolderFor(LocationType::USER);
+
+    for (const auto &entry :
+         juce::RangedDirectoryIterator(userDir, false, "*", juce::File::findDirectories))
+    {
+        userThemes.emplace_back(LocationType::USER, entry.getFile().getFileName(), entry.getFile());
+    }
+
+    std::sort(userThemes.begin(), userThemes.end(),
+              [](const ThemeLocation &a, const ThemeLocation &b) {
+                  return strnatcasecmp(a.dirName.toRawUTF8(), b.dirName.toRawUTF8()) < 0;
+              });
+
+    themeLocations.insert(themeLocations.end(), userThemes.begin(), userThemes.end());
 }
 
 bool Utils::loadPatch(const PatchTreeNode::ptr_t &fxpFile)
 {
     auto res = loadPatch(fxpFile->file);
+
     if (res && hostUpdateCallback)
     {
         hostUpdateCallback(fxpFile->index);
@@ -243,16 +338,77 @@ bool Utils::loadPatch(const juce::File &fxpFile)
     juce::MemoryBlock mb;
 
     if (!fxpFile.loadFileAsData(mb))
+    {
         return false;
+    }
 
     if (loadMemoryBlockCallback)
     {
-        if (!loadMemoryBlockCallback(mb)) // todo make it respond to any program number
+        if (!loadMemoryBlockCallback(mb))
+        {
             return false;
+        }
     }
 
     currentPatch = fxpFile.getFileName();
     currentPatchFile = fxpFile;
+
+    return true;
+}
+
+bool Utils::loadPatch(const juce::File &fxpFile, Program &program)
+{
+    juce::MemoryBlock mb;
+
+    if (!fxpFile.loadFileAsData(mb))
+    {
+        return false;
+    }
+
+    if (loadMemoryBlockOntoProgramCallback)
+    {
+        return loadMemoryBlockOntoProgramCallback(mb, program);
+    }
+
+    return false;
+}
+
+bool Utils::serializeProgramToMemoryBlock(const Program &program, juce::MemoryBlock &out) const
+{
+    // Build the OB-Xf program XML directly from the supplied Program, mirroring
+    // the schema written by StateManager::getProgramStateInformation but without
+    // touching the active program or going through any callbacks.
+    juce::XmlElement xmlState("OB-Xf");
+    xmlState.setAttribute("ob-xf_version", humanReadableVersion(currentStreamingVersion));
+
+    for (const auto &[id, atomicVal] : program.values)
+        xmlState.setAttribute(id, static_cast<double>(atomicVal.load()));
+
+    xmlState.setAttribute("programName", program.getName());
+    xmlState.setAttribute("author", program.getAuthor());
+    xmlState.setAttribute("license", program.getLicense());
+    xmlState.setAttribute("category", program.getCategory());
+    xmlState.setAttribute("project", program.getProject());
+
+    juce::MemoryBlock xmlChunk;
+    juce::AudioProcessor::copyXmlToBinary(xmlState, xmlChunk);
+
+    const size_t totalLen = sizeof(fxProgramSet) + xmlChunk.getSize() - 8;
+    out.setSize(totalLen, true);
+
+    auto *set = static_cast<fxProgramSet *>(out.getData());
+    set->chunkMagic = fxbName("CcnK");
+    set->byteSize = 0;
+    set->fxMagic = fxbName("FPCh");
+    set->version = fxbSwap(fxbVersionNum);
+    set->fxID = fxbName("OBXf");
+    set->fxVersion = fxbSwap(fxbVersionNum);
+    set->numPrograms = fxbSwap(1);
+
+    program.getName().copyToUTF8(set->name, sizeof(set->name));
+
+    set->chunkSize = fxbSwap(static_cast<int32_t>(xmlChunk.getSize()));
+    xmlChunk.copyTo(set->chunk, 0, xmlChunk.getSize());
 
     return true;
 }
@@ -299,12 +455,16 @@ bool Utils::savePatch(const juce::File &fxpFile)
     if (serializePatchAsFXPOnto(memoryBlock))
     {
         if (!fxpFile.getParentDirectory().createDirectory())
+        {
             return false;
+        }
+
         fxpFile.replaceWithData(memoryBlock.getData(), memoryBlock.getSize());
         currentPatch = fxpFile.getFileName();
         currentPatchFile = fxpFile;
 
         rescanPatchTree();
+
         return true;
     }
     return false;
@@ -313,7 +473,9 @@ bool Utils::savePatch(const juce::File &fxpFile)
 void Utils::initializePatch() const
 {
     if (resetPatchToDefault)
+    {
         resetPatchToDefault();
+    }
 
     if (hostUpdateCallback)
     {
@@ -323,10 +485,11 @@ void Utils::initializePatch() const
 
 void Utils::copyPatch()
 {
-    juce::MemoryBlock serializedData;
-    if (serializePatchAsFXPOnto(serializedData))
+    juce::MemoryBlock mb;
+
+    if (serializePatchAsFXPOnto(mb))
     {
-        juce::SystemClipboard::copyTextToClipboard(serializedData.toBase64Encoding());
+        juce::SystemClipboard::copyTextToClipboard(mb.toBase64Encoding());
     }
 }
 
@@ -334,19 +497,25 @@ void Utils::pastePatch()
 {
     if (loadMemoryBlockCallback)
     {
-        juce::MemoryBlock memoryBlock;
-        if (memoryBlock.fromBase64Encoding(juce::SystemClipboard::getTextFromClipboard()))
-            loadMemoryBlockCallback(memoryBlock);
+        juce::MemoryBlock mb;
+
+        if (mb.fromBase64Encoding(juce::SystemClipboard::getTextFromClipboard()))
+        {
+            loadMemoryBlockCallback(mb);
+        }
     }
 }
 
 bool Utils::isPatchInClipboard()
 {
-    juce::MemoryBlock memoryBlock;
-    if (!memoryBlock.fromBase64Encoding(juce::SystemClipboard::getTextFromClipboard()))
-        return false;
+    juce::MemoryBlock mb;
 
-    return isMemoryBlockAPatch(memoryBlock);
+    if (!mb.fromBase64Encoding(juce::SystemClipboard::getTextFromClipboard()))
+    {
+        return false;
+    }
+
+    return isMemoryBlockAPatch(mb);
 }
 
 bool Utils::isMemoryBlockAPatch(const juce::MemoryBlock &mb)
@@ -355,11 +524,16 @@ bool Utils::isMemoryBlockAPatch(const juce::MemoryBlock &mb)
     const size_t dataSize = mb.getSize();
 
     if (dataSize < 28)
+    {
         return false;
+    }
 
     if (const fxSet *const set = static_cast<const fxSet *>(data);
         (!compareMagic(set->chunkMagic, "CcnK")) || fxbSwap(set->version) > fxbVersionNum)
+    {
         return false;
+    }
+
     return true;
 }
 
@@ -373,6 +547,7 @@ void Utils::setMenuScaleMode(MenuScaleMode msm)
 {
     config->setValue("menu_scale_mode", static_cast<int>(msm));
 }
+
 Utils::MenuScaleMode Utils::getMenuScaleMode() const
 {
     auto def = MenuScaleMode::WITH_OS;
@@ -406,6 +581,59 @@ void Utils::createDocumentFolderIfMissing()
             subFolder.createDirectory();
         }
     }
+
+#if JUCE_IOS
+    const auto patchFolder = docFolder.getChildFile("Patches");
+    const auto themeFolder = docFolder.getChildFile("Themes");
+
+    const auto hasUserPatches =
+        !patchFolder.findChildFiles(juce::File::findFiles, true, "*.fxp").isEmpty();
+    const auto hasUserThemes =
+        !themeFolder.findChildFiles(juce::File::findFiles, true, "theme.xml").isEmpty();
+
+    const auto currentApplication =
+        juce::File::getSpecialLocation(juce::File::currentApplicationFile);
+    const auto appBundleDir = currentApplication.hasFileExtension("app")
+                                  ? currentApplication
+                                  : currentApplication.getParentDirectory();
+    const auto appResourcesDir = appBundleDir.getChildFile("Resources");
+    const auto bundlePatchFolder = appBundleDir.getChildFile("Patches");
+    const auto resourcesPatchFolder = appResourcesDir.getChildFile("Patches");
+
+    const auto bundleFxpCountBefore = countFilesRecursive(bundlePatchFolder, "*.fxp");
+    const auto resourcesFxpCountBefore = countFilesRecursive(resourcesPatchFolder, "*.fxp");
+    const auto documentFxpCountBefore = countFilesRecursive(patchFolder, "*.fxp");
+
+    juce::Logger::writeToLog(
+        "[OB-Xf iOS bootstrap] bundle patch path: " + bundlePatchFolder.getFullPathName() +
+        " exists=" + juce::String((int)bundlePatchFolder.exists()));
+    juce::Logger::writeToLog(
+        "[OB-Xf iOS bootstrap] resources patch path: " + resourcesPatchFolder.getFullPathName() +
+        " exists=" + juce::String((int)resourcesPatchFolder.exists()));
+    juce::Logger::writeToLog(
+        "[OB-Xf iOS bootstrap] document patch path: " + patchFolder.getFullPathName() +
+        " exists=" + juce::String((int)patchFolder.exists()));
+    juce::Logger::writeToLog("[OB-Xf iOS bootstrap] .fxp counts before copy - bundle=" +
+                             juce::String(bundleFxpCountBefore) +
+                             " resources=" + juce::String(resourcesFxpCountBefore) +
+                             " documents=" + juce::String(documentFxpCountBefore) +
+                             " hasUserPatches=" + juce::String(hasUserPatches ? "true" : "false"));
+
+    if (!hasUserPatches)
+    {
+        copyDirectoryContents(appBundleDir.getChildFile("Patches"), patchFolder);
+        copyDirectoryContents(appResourcesDir.getChildFile("Patches"), patchFolder);
+    }
+
+    if (!hasUserThemes)
+    {
+        copyDirectoryContents(appBundleDir.getChildFile("Themes"), themeFolder);
+        copyDirectoryContents(appResourcesDir.getChildFile("Themes"), themeFolder);
+    }
+
+    juce::Logger::writeToLog("[OB-Xf iOS bootstrap] .fxp count after copy - documents=" +
+                             juce::String(countFilesRecursive(patchFolder, "*.fxp")));
+#endif
 }
 
 void Utils::resolveFactoryFolderInUse()

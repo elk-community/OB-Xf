@@ -1,16 +1,12 @@
 /*
- * OB-Xf - a continuation of the last open source version of OB-Xd.
- *
  * OB-Xd was originally written by Vadim Filatov, and then a version
  * was released under the GPL3 at https://github.com/reales/OB-Xd.
  * Subsequently, the product was continued by DiscoDSP and the copyright
- * holders as an excellent closed source product. For more info,
- * see "HISTORY.md" in the root of this repository.
+ * holders as an excellent closed source product.
  *
- * This repository is a successor to the last open source release,
- * a version marked as 2.11. Copyright 2013-2025 by the authors
- * as indicated in the original release, and subsequent authors
- * per the GitHub transaction log.
+ * This repository is a successor to OB-Xd version 2.11.
+ * Copyright 2013-2025 by the authors as indicated in the original release,
+ * and subsequent authors as per GitHub transaction log.
  *
  * OB-Xf is released under the GNU General Public Licence v3 or later
  * (GPL-3.0-or-later). The license is found in the file "LICENSE"
@@ -25,7 +21,7 @@
 
 #include "SynthEngine.h"
 #include "BlepData.h"
-#include <cassert>
+#include <cmath>
 
 class TriangleOsc
 {
@@ -77,17 +73,11 @@ class TriangleOsc
 
     inline float getValue(float x)
     {
-        float mix = x < 0.5 ? 2 * x - 0.5 : 1.5 - 2 * x;
-
-        return delay.feedReturn(mix);
+        /* triangle: 0.5 - 2*|x - 0.5|  (avoids branch, same result) */
+        return delay.feedReturn(0.5f - 2.f * std::fabs(x - 0.5f));
     }
 
-    inline float getValueFast(float x)
-    {
-        float mix = x < 0.5 ? 2 * x - 0.5 : 1.5 - 2 * x;
-
-        return mix;
-    }
+    inline float getValueFast(float x) { return 0.5f - 2.f * std::fabs(x - 0.5f); }
 
     inline void processFollower(float x, float delta, bool hardSyncReset, float hardSyncFrac)
     {
@@ -138,7 +128,7 @@ class TriangleOsc
         {
             float fracMaster = (delta * hardSyncFrac);
             float trans = (x - fracMaster);
-            float mix = trans < 0.5 ? 2 * trans - 0.5 : 1.5 - 2 * trans;
+            float mix = 0.5f - 2.f * std::fabs(trans - 0.5f);
 
             if (trans > 0.5)
             {
@@ -151,52 +141,39 @@ class TriangleOsc
 
     inline void mixInBlampCenter(float *buf, int &bpos, float offset, float scale)
     {
-        const float *table = blampPtr;
-        const size_t tableSize = (table == blamp) ? std::size(blamp) : std::size(blampd2);
+        int lpIn = static_cast<int>(B_OVERSAMPLING * offset);
+        if (lpIn >= B_OVERSAMPLING)
+            lpIn = B_OVERSAMPLING - 1;
 
-        int lpIn = static_cast<int>(B_OVERSAMPLING * (offset));
-        int maxIter = (static_cast<int>(tableSize) - 1 - (lpIn + 1)) / B_OVERSAMPLING + 1;
-        const int safeN = std::min(B_SAMPLESx2, maxIter);
         const float frac = offset * B_OVERSAMPLING - static_cast<float>(lpIn);
-        const float f1 = 1.0f - frac;
+        const float f1s = (1.0f - frac) * scale;
+        const float fracs = frac * scale;
 
-        for (int i = 0; i < safeN; i++)
-        {
-            assert(static_cast<size_t>(lpIn) + 1 < tableSize);
-            const float mixValue = (table[lpIn] * f1 + table[lpIn + 1] * frac);
+        const float *rowA = blampPtr + lpIn * B_SAMPLESx2;
+        const float *rowB = rowA + B_SAMPLESx2;
 
-            buf[(bpos + i) & (B_SAMPLESx2 - 1)] += mixValue * scale;
-            lpIn += B_OVERSAMPLING;
-        }
+        for (int i = 0; i < B_SAMPLESx2; i++)
+            buf[(bpos + i) & (B_SAMPLESx2 - 1)] += rowA[i] * f1s + rowB[i] * fracs;
     }
 
     inline void mixInImpulseCenter(float *buf, int &bpos, float offset, float scale)
     {
-        const float *table = blepPtr;
-        const size_t tableSize = (table == blep) ? std::size(blep) : std::size(blepd2);
+        int lpIn = static_cast<int>(B_OVERSAMPLING * offset);
+        if (lpIn >= B_OVERSAMPLING)
+            lpIn = B_OVERSAMPLING - 1;
 
-        int lpIn = static_cast<int>(B_OVERSAMPLING * (offset));
-        const int maxIter = (static_cast<int>(tableSize) - 1 - (lpIn + 1)) / B_OVERSAMPLING + 1;
-        const int safeSamples = std::min(B_SAMPLES, maxIter);
-        const int safeN = std::min(B_SAMPLESx2, maxIter);
-        const float frac = offset * B_OVERSAMPLING - lpIn;
-        const float f1 = 1.0f - frac;
+        const float frac = offset * B_OVERSAMPLING - static_cast<float>(lpIn);
+        const float f1s = (1.0f - frac) * scale;
+        const float fracs = frac * scale;
 
-        for (int i = 0; i < safeSamples; i++)
-        {
-            assert(static_cast<size_t>(lpIn) + 1 < tableSize);
-            const float mixValue = (table[lpIn] * f1 + table[lpIn + 1] * frac);
-            buf[(bpos + i) & (B_SAMPLESx2 - 1)] += mixValue * scale;
-            lpIn += B_OVERSAMPLING;
-        }
+        const float *rowA = blepPtr + lpIn * B_SAMPLESx2;
+        const float *rowB = rowA + B_SAMPLESx2;
 
-        for (int i = safeSamples; i < safeN; i++)
-        {
-            assert(static_cast<size_t>(lpIn) + 1 < tableSize);
-            const float mixValue = (table[lpIn] * f1 + table[lpIn + 1] * frac);
-            buf[(bpos + i) & (B_SAMPLESx2 - 1)] -= mixValue * scale;
-            lpIn += B_OVERSAMPLING;
-        }
+        for (int i = 0; i < B_SAMPLES; i++)
+            buf[(bpos + i) & (B_SAMPLESx2 - 1)] += rowA[i] * f1s + rowB[i] * fracs;
+
+        for (int i = B_SAMPLES; i < B_SAMPLESx2; i++)
+            buf[(bpos + i) & (B_SAMPLESx2 - 1)] -= rowA[i] * f1s + rowB[i] * fracs;
     }
 
     inline float getNextBlep(float *buf, int &bpos)

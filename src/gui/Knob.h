@@ -1,16 +1,12 @@
 /*
- * OB-Xf - a continuation of the last open source version of OB-Xd.
- *
  * OB-Xd was originally written by Vadim Filatov, and then a version
  * was released under the GPL3 at https://github.com/reales/OB-Xd.
  * Subsequently, the product was continued by DiscoDSP and the copyright
- * holders as an excellent closed source product. For more info,
- * see "HISTORY.md" in the root of this repository.
+ * holders as an excellent closed source product.
  *
- * This repository is a successor to the last open source release,
- * a version marked as 2.11. Copyright 2013-2025 by the authors
- * as indicated in the original release, and subsequent authors
- * per the GitHub transaction log.
+ * This repository is a successor to OB-Xd version 2.11.
+ * Copyright 2013-2025 by the authors as indicated in the original release,
+ * and subsequent authors as per GitHub transaction log.
  *
  * OB-Xf is released under the GNU General Public Licence v3 or later
  * (GPL-3.0-or-later). The license is found in the file "LICENSE"
@@ -39,8 +35,13 @@ class Knob final : public juce::Slider,
                    public HasScaleFactor,
                    public HasParameterWithID
 {
+  public:
     juce::String img_name;
     ScalingImageCache &imageCache;
+
+    std::function<double(double)> cmdDragCallback, altDragCallback, alternativeValueMapCallback;
+    std::function<juce::String(double)> customTextFromValue;
+    std::function<double(const juce::String &)> customValueFromText;
 
     struct MenuValueTypein final : juce::PopupMenu::CustomComponent, juce::TextEditor::Listener
     {
@@ -57,7 +58,7 @@ class Knob final : public juce::Slider,
             textEditor->setIndents(2, 0);
             textEditor->setCaretVisible(true);
             textEditor->setReadOnly(false);
-            textEditor->setTitle(k->parameter->getName(128));
+            textEditor->setTitle(k->parameter ? k->parameter->getName(128) : k->getTitle());
 
             addAndMakeVisible(*textEditor);
         }
@@ -67,7 +68,7 @@ class Knob final : public juce::Slider,
             auto lf = obxf::obxfLookAndFeel(knob);
             auto sf = lf ? lf->menuScaleFactor() : 1.0f;
             width = 120 * sf;
-            height = 28 * sf;
+            height = 20 * sf;
         }
 
         void resized() override { textEditor->setBounds(getLocalBounds().reduced(3, 1)); }
@@ -77,7 +78,9 @@ class Knob final : public juce::Slider,
             juce::Timer::callAfterDelay(2, [this]() {
                 if (textEditor->isVisible() && knob)
                 {
-                    auto txt = juce::String(knob->getValue());
+                    auto txt = knob->customTextFromValue
+                                   ? knob->customTextFromValue(knob->getValue())
+                                   : juce::String(knob->getValue());
                     auto md = knob->getMetadata();
 
                     if (md.has_value())
@@ -90,25 +93,30 @@ class Knob final : public juce::Slider,
                                   .value_or(juce::String(denorm).toStdString());
                     }
 
-                    textEditor->setText(txt, juce::dontSendNotification);
-                    textEditor->setJustification(juce::Justification::centredLeft);
-
-                    const auto valCol = juce::Colour(0xFFFF9000);
+                    const auto lf = obxf::obxfLookAndFeel(knob);
+                    const auto sf = lf ? lf->menuScaleFactor() : 1.0f;
+                    const auto font = juce::FontOptions(15.f * sf);
+                    const auto color = lf ? lf->textInputColour : juce::Colours::red;
 
                     textEditor->setColour(juce::TextEditor::ColourIds::backgroundColourId,
-                                          valCol.withAlpha(0.1f));
+                                          juce::Colours::transparentBlack);
                     textEditor->setColour(juce::TextEditor::ColourIds::highlightColourId,
-                                          valCol.withAlpha(0.15f));
+                                          juce::Colour(0x20FFFFFF));
+                    textEditor->setColour(juce::TextEditor::ColourIds::highlightedTextColourId,
+                                          color);
                     textEditor->setColour(juce::TextEditor::ColourIds::outlineColourId,
-                                          juce::Colours::black.withAlpha(0.f));
+                                          juce::Colours::transparentBlack);
                     textEditor->setColour(juce::TextEditor::ColourIds::focusedOutlineColourId,
-                                          juce::Colours::black.withAlpha(0.f));
-                    textEditor->setBorder(juce::BorderSize<int>(3));
-                    textEditor->applyColourToAllText(valCol, true);
+                                          juce::Colours::transparentBlack);
+                    textEditor->setColour(juce::CaretComponent::caretColourId, color);
 
-                    auto lf = obxf::obxfLookAndFeel(knob);
-                    auto sf = lf ? lf->menuScaleFactor() : 1.0f;
-                    textEditor->applyFontToAllText(juce::FontOptions(14.f * sf), true);
+                    textEditor->setFont(font);
+                    textEditor->applyFontToAllText(font, true);
+                    textEditor->applyColourToAllText(color, true);
+
+                    textEditor->setJustification(juce::Justification::centred);
+                    textEditor->setText(txt, juce::dontSendNotification);
+
                     textEditor->grabKeyboardFocus();
                     textEditor->selectAll();
                 }
@@ -128,7 +136,6 @@ class Knob final : public juce::Slider,
                 {
                     std::string em;
                     pmd::FeatureState fs;
-                    fs.isExtended = true;
                     auto vv = md->valueFromString(textEditor->getText().toStdString(), em, fs);
                     if (!vv.has_value())
                     {
@@ -142,7 +149,14 @@ class Knob final : public juce::Slider,
                 }
                 else
                 {
-                    v = textEditor->getText().getDoubleValue();
+                    if (knob->customValueFromText)
+                    {
+                        v = knob->customValueFromText(textEditor->getText());
+                    }
+                    else
+                    {
+                        v = textEditor->getText().getDoubleValue();
+                    }
                 }
 
                 knob->setValue(juce::jlimit(knob->getMinimum(), knob->getMaximum(), v),
@@ -166,7 +180,6 @@ class Knob final : public juce::Slider,
         }
     };
 
-  public:
     Knob(juce::String name, const int fh, ObxfAudioProcessor *owner_, ScalingImageCache &cache)
         : Slider("Knob"), img_name(std::move(name)), imageCache(cache), owner(owner_)
     {
@@ -224,7 +237,14 @@ class Knob final : public juce::Slider,
 
         auto md = getMetadata();
 
-        menu.addSectionHeader(parameter->getName(128));
+        if (parameter)
+        {
+            menu.addSectionHeader(parameter->getName(128));
+        }
+        else
+        {
+            menu.addSectionHeader(getTitle());
+        }
 
         menu.addSeparator();
 
@@ -234,9 +254,18 @@ class Knob final : public juce::Slider,
         menu.addSeparator();
 
         menu.addItem(toOSCase("Reset to Default"), [safeThis]() {
-            if (safeThis && safeThis->parameter)
-                safeThis->setValue(safeThis->parameter->getDefaultValue(),
-                                   juce::sendNotificationAsync);
+            if (safeThis)
+            {
+                if (safeThis->parameter)
+                {
+                    safeThis->setValue(safeThis->parameter->getDefaultValue(),
+                                       juce::sendNotificationAsync);
+                }
+                else
+                {
+                    safeThis->setValue(0.0, juce::sendNotificationAsync);
+                }
+            }
         });
 
         if (isPanKnob())
@@ -286,29 +315,31 @@ class Knob final : public juce::Slider,
 
         auto editor = owner->getActiveEditor();
 
-        if (editor)
+        if (editor && obxf::useHostContextMenus(editor))
         {
-            if (std::strcmp(juce::PluginHostType().getHostDescription(), "Unknown") != 0)
+            if (auto *c = editor->getHostContext())
             {
-                if (auto *c = editor->getHostContext())
+                if (auto menuInfo = c->getContextMenuForParameter(parameter))
                 {
-                    if (auto menuInfo = c->getContextMenuForParameter(parameter))
+                    auto hostMenu = menuInfo->getEquivalentPopupMenu();
+
+                    auto lf = obxf::obxfLookAndFeel(editor);
+
+                    if (lf)
                     {
-                        auto hostMenu = menuInfo->getEquivalentPopupMenu();
+                        hostMenu = lf->modifyHostMenu(hostMenu);
+                    }
 
-                        hostMenu = modifyHostMenu(hostMenu);
+                    // merge host menu with our usual context menu
+                    if (hostMenu.getNumItems() > 0)
+                    {
+                        menu.addSeparator();
 
-                        // merge host menu with our usual context menu
-                        if (hostMenu.getNumItems() > 0)
+                        juce::PopupMenu::MenuItemIterator iterator(hostMenu);
+
+                        while (iterator.next())
                         {
-                            menu.addSeparator();
-
-                            juce::PopupMenu::MenuItemIterator iterator(hostMenu);
-
-                            while (iterator.next())
-                            {
-                                menu.addItem(iterator.getItem());
-                            }
+                            menu.addItem(iterator.getItem());
                         }
                     }
                 }
@@ -340,7 +371,7 @@ class Knob final : public juce::Slider,
 
     void mouseWheelMove(const juce::MouseEvent &e, const juce::MouseWheelDetails &d) override
     {
-        // juce::Slider provides the wheel support ut we want shift to be slower so
+        // juce::Slider provides the wheel support but we want shift to be slower so
         // whack the event before we call it.
         if (e.mods.isShiftDown())
         {
@@ -359,6 +390,11 @@ class Knob final : public juce::Slider,
 
     juce::String getTextFromValue(double value) override
     {
+        if (customTextFromValue)
+        {
+            return customTextFromValue(value);
+        }
+
         if (auto *op = dynamic_cast<ObxfParameterFloat *>(parameter))
         {
             return op->stringFromValue(static_cast<float>(op->denormalizedValue(value)), 0).c_str();
@@ -369,6 +405,11 @@ class Knob final : public juce::Slider,
 
     double getValueFromText(const juce::String &text) override
     {
+        if (customValueFromText)
+        {
+            return customValueFromText(text);
+        }
+
         if (auto *op = dynamic_cast<ObxfParameterFloat *>(parameter))
         {
             return op->valueFromString(text.toStdString());
@@ -398,6 +439,32 @@ class Knob final : public juce::Slider,
         if (alternativeValueMapCallback)
         {
             setValue(alternativeValueMapCallback(getValue()), juce::sendNotificationAsync);
+        }
+    }
+
+    std::function<void()> onDragStart, onDragEnd;
+
+    bool isDraggingNow() const { return draggingFlag; }
+
+    void startedDragging() override
+    {
+        Slider::startedDragging();
+        draggingFlag = true;
+
+        if (onDragStart)
+        {
+            onDragStart();
+        }
+    }
+
+    void stoppedDragging() override
+    {
+        draggingFlag = false;
+        Slider::stoppedDragging();
+
+        if (onDragEnd)
+        {
+            onDragEnd();
         }
     }
 
@@ -495,8 +562,6 @@ class Knob final : public juce::Slider,
         }
     }
 
-    std::function<double(double)> cmdDragCallback, altDragCallback, alternativeValueMapCallback;
-
     bool keyPressed(const juce::KeyPress &e) override
     {
         if (e.getModifiers().isShiftDown() && e.getKeyCode() == juce::KeyPress::F10Key)
@@ -548,56 +613,8 @@ class Knob final : public juce::Slider,
         return false;
     }
 
-    juce::PopupMenu modifyHostMenu(juce::PopupMenu menu)
-    {
-        // make things look a bit nicer for our friends from Image-Line
-        if (juce::PluginHostType().isFruityLoops())
-        {
-            auto it = juce::PopupMenu::MenuItemIterator(menu);
-
-            while (it.next())
-            {
-                auto txt = it.getItem().text;
-
-                if (txt.startsWithChar('-'))
-                {
-                    it.getItem().isSectionHeader = true;
-                    it.getItem().text = txt.fromFirstOccurrenceOf("-", false, false);
-                }
-            }
-
-            return menu;
-        }
-
-        // we really don't need that parameter name repeated in Reaper...
-        if (juce::PluginHostType().isReaper())
-        {
-            auto newMenu = juce::PopupMenu();
-            auto it = juce::PopupMenu::MenuItemIterator(menu);
-
-            while (it.next())
-            {
-                auto txt = it.getItem().text;
-                bool include = true;
-
-                if (txt.startsWithChar('[') && txt.endsWithChar(']'))
-                {
-                    include = it.next();
-                }
-
-                if (include)
-                {
-                    newMenu.addItem(it.getItem());
-                }
-            }
-
-            return newMenu;
-        }
-
-        return menu;
-    }
-
     bool isSVG{false};
+    bool draggingFlag{false};
 
     juce::Image kni;
 
